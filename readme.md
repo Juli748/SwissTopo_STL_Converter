@@ -108,6 +108,7 @@ Options you can use here:
 - --step N: downsample grid by keeping every Nth point in X and Y
 - --tol T: snap X/Y values to a grid of size T for noisy coordinates
 - --z-scale S: multiply all Z values (e.g. 2 for exaggeration)
+- --assume-grid: skip Delaunay fallback and require a full grid (faster, but errors on incomplete data)
 - --name NAME: set the STL solid name inside the file
 - --make-solid: add a flat bottom and side walls to make a watertight solid
 - --base-thickness T: set base plane to minZ - T
@@ -124,6 +125,7 @@ Options you can use here:
 - --step N: downsample grid by keeping every Nth point in X and Y
 - --tol T: snap X/Y values to a grid of size T for noisy coordinates
 - --z-scale S: multiply all Z values (e.g. 2 for exaggeration)
+- --assume-grid: skip Delaunay fallback and require a full grid (faster, but errors on incomplete data)
 Notes:
 - --make-solid is ignored in batch mode (global base is added after merging).
 

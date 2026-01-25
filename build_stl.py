@@ -130,7 +130,13 @@ def _grid_prepare(points: np.ndarray, tol: float = 0.0) -> Optional[Tuple[np.nda
     return verts, nx, ny
 
 
-def try_structured_grid(points: np.ndarray, tol: float = 0.0, step: int = 1) -> Optional[Mesh]:
+def try_structured_grid(
+    points: np.ndarray,
+    tol: float = 0.0,
+    step: int = 1,
+    *,
+    assume_grid: bool = False,
+) -> Optional[Mesh]:
     print("[2/4] Checking whether points form a structured grid...")
 
     if step < 1:
@@ -138,6 +144,8 @@ def try_structured_grid(points: np.ndarray, tol: float = 0.0, step: int = 1) -> 
 
     prepared = _grid_prepare(points, tol=tol)
     if prepared is None:
+        if assume_grid:
+            raise ValueError("Structured grid expected but points do not form a complete grid.")
         print("  Not a complete grid -> will fall back to Delaunay triangulation (SciPy).")
         return None
 
@@ -160,29 +168,20 @@ def try_structured_grid(points: np.ndarray, tol: float = 0.0, step: int = 1) -> 
         print(f"  Grid size: {nx:,}x{ny:,} -> {nx2:,}x{ny2:,}")
         nx, ny = nx2, ny2
 
-    print("  Building faces...")
+    print("  Building faces (vectorized)...")
 
-    faces: List[Tuple[int, int, int]] = []
+    grid = np.arange(nx * ny, dtype=np.int64).reshape(ny, nx)
+    v00 = grid[:-1, :-1].ravel()
+    v10 = grid[:-1, 1:].ravel()
+    v01 = grid[1:, :-1].ravel()
+    v11 = grid[1:, 1:].ravel()
+
+    faces_arr = np.vstack([
+        np.stack([v00, v10, v11], axis=1),
+        np.stack([v00, v11, v01], axis=1),
+    ])
+
     total_cells = (ny - 1) * (nx - 1)
-    report_every = max(1, total_cells // 10)
-
-    cell_count = 0
-    for row in range(ny - 1):
-        for col in range(nx - 1):
-            v00 = row * nx + col
-            v10 = row * nx + (col + 1)
-            v01 = (row + 1) * nx + col
-            v11 = (row + 1) * nx + (col + 1)
-
-            faces.append((v00, v10, v11))
-            faces.append((v00, v11, v01))
-
-            cell_count += 1
-            if cell_count % report_every == 0 or cell_count == total_cells:
-                pct = (cell_count / total_cells) * 100.0
-                print(f"  Faces: {cell_count:,}/{total_cells:,} cells ({pct:.0f}%)")
-
-    faces_arr = np.asarray(faces, dtype=np.int64)
     print(f"  Built {faces_arr.shape[0]:,} triangles from {total_cells:,} cells.")
     return Mesh(vertices=verts, faces=faces_arr)
 
@@ -218,18 +217,29 @@ def compute_normal(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> Tuple[float, 
     return (float(n[0]), float(n[1]), float(n[2]))
 
 
+def compute_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    a = vertices[faces[:, 0]]
+    b = vertices[faces[:, 1]]
+    c = vertices[faces[:, 2]]
+    n = np.cross(b - a, c - a)
+    norm = np.linalg.norm(n, axis=1)
+    n = np.divide(n, norm[:, None], out=np.zeros_like(n), where=norm[:, None] != 0)
+    return n
+
+
 def write_ascii_stl(mesh: Mesh, out_path: Path, solid_name: str = "terrain") -> None:
     print(f"[3/4] Writing ASCII STL: {out_path}")
 
     v = mesh.vertices
     f = mesh.faces
     report_every = max(1, f.shape[0] // 10)
+    normals = compute_normals(v, f)
 
     with out_path.open("w", encoding="utf-8") as w:
         w.write(f"solid {solid_name}\n")
         for idx, (i0, i1, i2) in enumerate(f, 1):
             a, b, c = v[i0], v[i1], v[i2]
-            nx, ny, nz = compute_normal(a, b, c)
+            nx, ny, nz = normals[idx - 1]
             w.write(f"  facet normal {nx:.8e} {ny:.8e} {nz:.8e}\n")
             w.write("    outer loop\n")
             w.write(f"      vertex {a[0]:.8e} {a[1]:.8e} {a[2]:.8e}\n")
@@ -252,27 +262,31 @@ def write_binary_stl(mesh: Mesh, out_path: Path, solid_name: str = "terrain") ->
 
     v = mesh.vertices
     f = mesh.faces
-    report_every = max(1, f.shape[0] // 10)
 
     header = (solid_name[:80]).encode("ascii", errors="ignore").ljust(80, b"\0")
+    normals = compute_normals(v, f).astype(np.float32, copy=False)
+    a = v[f[:, 0]].astype(np.float32, copy=False)
+    b = v[f[:, 1]].astype(np.float32, copy=False)
+    c = v[f[:, 2]].astype(np.float32, copy=False)
+
+    tri_dtype = np.dtype([
+        ("normal", "<f4", (3,)),
+        ("v1", "<f4", (3,)),
+        ("v2", "<f4", (3,)),
+        ("v3", "<f4", (3,)),
+        ("attr", "<u2"),
+    ])
+    tri_data = np.empty((f.shape[0],), dtype=tri_dtype)
+    tri_data["normal"] = normals
+    tri_data["v1"] = a
+    tri_data["v2"] = b
+    tri_data["v3"] = c
+    tri_data["attr"] = 0
 
     with out_path.open("wb") as w:
         w.write(header)
         w.write(struct.pack("<I", int(f.shape[0])))
-
-        for idx, (i0, i1, i2) in enumerate(f, 1):
-            a, b, c = v[i0], v[i1], v[i2]
-            nx, ny, nz = compute_normal(a, b, c)
-
-            w.write(struct.pack("<3f", float(nx), float(ny), float(nz)))
-            w.write(struct.pack("<3f", float(a[0]), float(a[1]), float(a[2])))
-            w.write(struct.pack("<3f", float(b[0]), float(b[1]), float(b[2])))
-            w.write(struct.pack("<3f", float(c[0]), float(c[1]), float(c[2])))
-            w.write(struct.pack("<H", 0))
-
-            if idx % report_every == 0 or idx == f.shape[0]:
-                pct = (idx / f.shape[0]) * 100.0
-                print(f"  ... {idx:,}/{f.shape[0]:,} triangles written ({pct:.0f}%)")
+        w.write(tri_data.tobytes())
 
     print("[4/4] Done.")
 
@@ -493,6 +507,7 @@ def convert_one(
     make_solid_flag: bool,
     base_thickness_value: float,
     base_z_value: Optional[float],
+    assume_grid: bool,
 ) -> None:
     print("\n" + "=" * 80)
     print(f"Converting: {xyz_path.name} -> {stl_path.name}")
@@ -504,7 +519,7 @@ def convert_one(
         pts = pts.copy()
         pts[:, 2] *= float(z_scale)
 
-    mesh = try_structured_grid(pts, tol=float(tol), step=int(step))
+    mesh = try_structured_grid(pts, tol=float(tol), step=int(step), assume_grid=bool(assume_grid))
     if mesh is None:
         mesh = delaunay_triangulation(pts)
 
@@ -764,6 +779,12 @@ def main() -> None:
              "Example: step=10 turns 0.5m spacing into 5m spacing.",
     )
     ap.add_argument(
+        "--assume-grid",
+        action="store_true",
+        help="Assume the XYZ data is a complete grid (skip Delaunay fallback). "
+             "This is faster but will error if the grid is incomplete.",
+    )
+    ap.add_argument(
         "--binary",
         action="store_true",
         help="Write Binary STL instead of ASCII (much smaller).",
@@ -838,6 +859,7 @@ def main() -> None:
                     make_solid_flag=False,
                     base_thickness_value=float(args.base_thickness),
                     base_z_value=args.base_z,
+                    assume_grid=bool(args.assume_grid),
                 )
             except Exception as e:
                 print(f"ERROR converting {xyz_path}: {e}")
@@ -858,6 +880,7 @@ def main() -> None:
         make_solid_flag=bool(args.make_solid),
         base_thickness_value=float(args.base_thickness),
         base_z_value=args.base_z,
+        assume_grid=bool(args.assume_grid),
     )
 
 
