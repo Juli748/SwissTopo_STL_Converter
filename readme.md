@@ -41,8 +41,7 @@ Download the **swissALTI3D** dataset for your area of interest and export or con
 
 Typical workflow:
 
-* Download swissALTI3D tiles
-* Load them into a GIS tool (e.g. QGIS)
+* Download swissALTI3D tiles as .xyz
 * Export the elevation grid as **XYZ**
 * Place the resulting `.xyz` files into the `./terrain` folder
 
@@ -104,6 +103,30 @@ Notes:
 ## Basic usage
 
 ### 1) Convert a single file
+
+```
+python build_stl.py input.xyz output.stl
+```
+
+This:
+
+* Reads `input.xyz`
+* Builds a terrain surface
+* Writes `output.stl` (ASCII STL by default)
+
+#### Make it printable (solid)
+
+If you want a **watertight, 3D-printable** model (filled below the terrain), add `--make-solid`.
+
+```
+python build_stl.py input.xyz output.stl --binary --make-solid --base-thickness 10
+```
+
+Options:
+
+* `--make-solid` adds a flat bottom + side walls
+* `--base-thickness T` sets the bottom plane to `minZ - T`
+* `--base-z Z` sets an explicit bottom plane Z (overrides thickness)
 
 ```
 python build_stl.py input.xyz output.stl
