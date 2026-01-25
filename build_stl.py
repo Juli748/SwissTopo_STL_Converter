@@ -11,7 +11,7 @@ NEW:
 Notes:
 - Binary STL merge needs a two-pass write (to know triangle count). ASCII can stream.
 - This merger supports both ASCII and Binary STL inputs.
-- Output can be ASCII (default) or Binary (--binary).
+- Output can be Binary (default) or ASCII (--ascii).
 
 Printable solid:
 - If --make-solid is passed in XYZ->STL modes, the terrain surface is turned into a printable solid
@@ -779,15 +779,21 @@ def main() -> None:
              "Example: step=10 turns 0.5m spacing into 5m spacing.",
     )
     ap.add_argument(
-        "--assume-grid",
+        "--no-assume-grid",
         action="store_true",
-        help="Assume the XYZ data is a complete grid (skip Delaunay fallback). "
-             "This is faster but will error if the grid is incomplete.",
+        help="Disable grid assumption and allow Delaunay fallback. "
+             "Use this if the XYZ data is not a complete grid.",
     )
-    ap.add_argument(
+    format_group = ap.add_mutually_exclusive_group()
+    format_group.add_argument(
+        "--ascii",
+        action="store_true",
+        help="Write ASCII STL instead of Binary (Binary is default).",
+    )
+    format_group.add_argument(
         "--binary",
         action="store_true",
-        help="Write Binary STL instead of ASCII (much smaller).",
+        help="Write Binary STL (default; provided for explicitness).",
     )
 
     ap.add_argument(
@@ -828,7 +834,7 @@ def main() -> None:
         # Load + weld for seamless joins; solidify once globally if requested.
         merge_stls_mesh(
             Path(out_path),
-            binary_out=bool(args.binary),
+            binary_out=not bool(args.ascii),
             solid_name=str(args.name) if args.name else "terrain_merged",
             weld_tol=float(args.weld_tol),
             make_solid_flag=bool(args.make_solid),
@@ -855,11 +861,11 @@ def main() -> None:
                     tol=float(args.tol),
                     z_scale=float(args.z_scale),
                     step=int(args.step),
-                    binary=bool(args.binary),
+                    binary=not bool(args.ascii),
                     make_solid_flag=False,
                     base_thickness_value=float(args.base_thickness),
                     base_z_value=args.base_z,
-                    assume_grid=bool(args.assume_grid),
+                    assume_grid=not bool(args.no_assume_grid),
                 )
             except Exception as e:
                 print(f"ERROR converting {xyz_path}: {e}")
@@ -876,11 +882,11 @@ def main() -> None:
         tol=float(args.tol),
         z_scale=float(args.z_scale),
         step=int(args.step),
-        binary=bool(args.binary),
+        binary=not bool(args.ascii),
         make_solid_flag=bool(args.make_solid),
         base_thickness_value=float(args.base_thickness),
         base_z_value=args.base_z,
-        assume_grid=bool(args.assume_grid),
+        assume_grid=not bool(args.no_assume_grid),
     )
 
 

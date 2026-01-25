@@ -18,19 +18,19 @@ Swisstopo sources:
 2) Convert each XYZ to STL (one STL per tile)
 
 ```
-python build_stl.py --all --step 10 --binary
+python build_stl.py --all --step 10
 ```
 
 3) Merge all STL tiles into one seamless STL
 
 ```
-python build_stl.py --merge-stl merged_terrain.stl --binary --weld-tol 0.001
+python build_stl.py --merge-stl merged_terrain.stl --weld-tol 0.001
 ```
 
 4) (Optional) Make the merged STL printable with a global base
 
 ```
-python build_stl.py --merge-stl merged_terrain.stl --binary --make-solid --base-thickness 10 --weld-tol 0.001
+python build_stl.py --merge-stl merged_terrain.stl --make-solid --base-thickness 10 --weld-tol 0.001
 ```
 
 The base is added at the lowest point of the merged terrain minus the extra thickness.
@@ -75,21 +75,21 @@ Notes:
 Fast and manageable for large areas:
 
 ```
-python build_stl.py --all --step 10 --binary
-python build_stl.py --merge-stl merged_terrain.stl --binary --weld-tol 0.001
+python build_stl.py --all --step 10
+python build_stl.py --merge-stl merged_terrain.stl --weld-tol 0.001
 ```
 
 Higher detail (bigger files):
 
 ```
-python build_stl.py --all --step 4 --binary
-python build_stl.py --merge-stl merged_terrain.stl --binary --weld-tol 0.001
+python build_stl.py --all --step 4
+python build_stl.py --merge-stl merged_terrain.stl --weld-tol 0.001
 ```
 
 Printable with a global base:
 
 ```
-python build_stl.py --merge-stl merged_terrain.stl --binary --make-solid --base-thickness 10 --weld-tol 0.001
+python build_stl.py --merge-stl merged_terrain.stl --make-solid --base-thickness 10 --weld-tol 0.001
 ```
 
 ---
@@ -104,11 +104,11 @@ Arguments:
 - input.xyz (required): path to one XYZ file to convert
 - output.stl (required): output STL path for the converted mesh
 Options you can use here:
-- --binary: write Binary STL (much smaller than ASCII)
+- --ascii: write ASCII STL (Binary is default and much smaller)
 - --step N: downsample grid by keeping every Nth point in X and Y
 - --tol T: snap X/Y values to a grid of size T for noisy coordinates
 - --z-scale S: multiply all Z values (e.g. 2 for exaggeration)
-- --assume-grid: skip Delaunay fallback and require a full grid (faster, but errors on incomplete data)
+ - --no-assume-grid: allow Delaunay fallback if the grid is incomplete
 - --name NAME: set the STL solid name inside the file
 - --make-solid: add a flat bottom and side walls to make a watertight solid
 - --base-thickness T: set base plane to minZ - T
@@ -121,11 +121,11 @@ python build_stl.py --all [options]
 Arguments:
 - --all (required): convert every .xyz under ./terrain
 Options you can use here:
-- --binary: write Binary STL (much smaller than ASCII)
+- --ascii: write ASCII STL (Binary is default and much smaller)
 - --step N: downsample grid by keeping every Nth point in X and Y
 - --tol T: snap X/Y values to a grid of size T for noisy coordinates
 - --z-scale S: multiply all Z values (e.g. 2 for exaggeration)
-- --assume-grid: skip Delaunay fallback and require a full grid (faster, but errors on incomplete data)
+ - --no-assume-grid: allow Delaunay fallback if the grid is incomplete
 Notes:
 - --make-solid is ignored in batch mode (global base is added after merging).
 
@@ -137,7 +137,7 @@ Arguments:
 - --merge-stl (required): merge all .stl under ./terrain
 - merged_terrain.stl (required): output STL path
 Options you can use here:
-- --binary: write Binary STL (much smaller than ASCII)
+- --ascii: write ASCII STL (Binary is default and much smaller)
 - --name NAME: set the STL solid name inside the file
 - --weld-tol T: weld shared vertices within tolerance to remove seams
 - --make-solid: add a global base and side walls to the merged terrain
@@ -165,7 +165,7 @@ SciPy error:
 
 Very large STL:
 - Increase --step
-- Always use --binary
+- Binary output is default; use --ascii only if you specifically need ASCII
 
 ---
 
