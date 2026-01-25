@@ -132,14 +132,22 @@ def try_structured_grid(points: np.ndarray, tol: float = 0.0, step: int = 1) -> 
     verts, nx, ny = prepared
     print(f"  Grid detected: {nx:,} x {ny:,} = {nx*ny:,} points")
 
+        # Optional downsample
     if step > 1:
         print(f"  Downsampling grid by step={step} (keeping every {step}th point in X and Y)...")
         verts_grid = verts.reshape(ny, nx, 3)
-        verts_grid = verts_grid[::step, ::step, :]
+
+        # Keep boundaries so adjacent tiles still touch even when (nx-1) or (ny-1) is not divisible by step.
+        x_idx = np.unique(np.r_[np.arange(0, nx, step), nx - 1])
+        y_idx = np.unique(np.r_[np.arange(0, ny, step), ny - 1])
+
+        verts_grid = verts_grid[np.ix_(y_idx, x_idx)]
         ny2, nx2 = verts_grid.shape[0], verts_grid.shape[1]
         verts = verts_grid.reshape(ny2 * nx2, 3)
+
         print(f"  Grid size: {nx:,}x{ny:,} -> {nx2:,}x{ny2:,}")
         nx, ny = nx2, ny2
+
 
     print("  Building faces...")
 
