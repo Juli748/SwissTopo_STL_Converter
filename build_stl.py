@@ -735,7 +735,8 @@ def main() -> None:
     ap.add_argument(
         "--merge-stl",
         action="store_true",
-        help="Merge existing .stl files found under ./terrain into one combined STL (no XYZ processing).",
+        help="Merge existing .stl files found under ./terrain into one combined STL (no XYZ processing). "
+             "Welds shared vertices for seamless joins.",
     )
 
     ap.add_argument("xyz", nargs="?", type=Path, help="Input XYZ file (x y z per line)")
@@ -771,13 +772,15 @@ def main() -> None:
     ap.add_argument(
         "--make-solid",
         action="store_true",
-        help="Make the terrain printable by adding a flat bottom and side walls (watertight solid).",
+        help="Make the terrain printable by adding a flat bottom and side walls (watertight solid). "
+             "Ignored in --all mode; use --merge-stl for a global base.",
     )
     ap.add_argument(
         "--base-thickness",
         type=float,
         default=5.0,
-        help="If --make-solid is set and --base-z is not given, base_z = min_z - base_thickness (default: 5.0).",
+        help="If --make-solid is set and --base-z is not given, base_z = min_z - base_thickness "
+             "(default: 5.0). This is the extra base below the lowest point.",
     )
     ap.add_argument(
         "--base-z",
@@ -790,7 +793,7 @@ def main() -> None:
         "--weld-tol",
         type=float,
         default=0.001,
-        help="Vertex weld tolerance used for global merge/solidify (default: 0.001). "
+        help="Vertex weld tolerance used for merge/solidify (default: 0.001). "
              "Use something like 0.001 or 0.01 to remove tile seams.",
     )
 
@@ -801,26 +804,22 @@ def main() -> None:
         if out_path is None:
             ap.error("With --merge-stl you must provide the output STL path (e.g. merged_terrain.stl).")
 
-        # If you want a global printable solid, we must load + weld + solidify once.
-        if bool(args.make_solid):
-            merge_stls_mesh(
-                Path(out_path),
-                binary_out=bool(args.binary),
-                solid_name=str(args.name) if args.name else "terrain_merged",
-                weld_tol=float(args.weld_tol),
-                make_solid_flag=True,
-                base_thickness_value=float(args.base_thickness),
-                base_z_value=args.base_z,
-            )
-        else:
-            merge_stls_streaming(
-                Path(out_path),
-                binary_out=bool(args.binary),
-                solid_name=str(args.name) if args.name else "terrain_merged",
-            )
+        # Load + weld for seamless joins; solidify once globally if requested.
+        merge_stls_mesh(
+            Path(out_path),
+            binary_out=bool(args.binary),
+            solid_name=str(args.name) if args.name else "terrain_merged",
+            weld_tol=float(args.weld_tol),
+            make_solid_flag=bool(args.make_solid),
+            base_thickness_value=float(args.base_thickness),
+            base_z_value=args.base_z,
+        )
         return
 
     if args.all:
+        if bool(args.make_solid):
+            print("[WARN] --make-solid is ignored in --all mode. "
+                  "Use --merge-stl --make-solid to add a global base after merging.")
         xyz_files = _list_xyz_files_in_terrain()
         print(f"Found {len(xyz_files)} .xyz file(s) in {Path('./terrain').resolve()}")
 
@@ -836,7 +835,7 @@ def main() -> None:
                     z_scale=float(args.z_scale),
                     step=int(args.step),
                     binary=bool(args.binary),
-                    make_solid_flag=bool(args.make_solid),
+                    make_solid_flag=False,
                     base_thickness_value=float(args.base_thickness),
                     base_z_value=args.base_z,
                 )
@@ -864,3 +863,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+    
