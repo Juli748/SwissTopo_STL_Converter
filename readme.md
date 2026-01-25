@@ -79,6 +79,30 @@ All batch operations assume `.xyz` files live in the `./terrain` folder.
 
 ## Basic usage
 
+### 0) Merge existing STL tiles into ONE STL (no XYZ processing)
+
+If you already converted all tiles to STL and just want **one combined terrain STL**, use:
+
+```
+python build_stl.py --merge-stl merged_terrain.stl --binary
+```
+
+This:
+
+* Searches **recursively** for all `.stl` files under `./terrain`
+* Does **not** re-read or re-triangulate any `.xyz` files
+* Merges all triangles into **one big STL**
+* Preserves geometry exactly (no resampling)
+
+Notes:
+
+* Binary output is strongly recommended for large terrains
+* Both ASCII and Binary input STLs are supported
+
+---
+
+## Basic usage
+
 ### 1) Convert a single file
 
 ```

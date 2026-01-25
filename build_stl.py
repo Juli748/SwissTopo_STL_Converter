@@ -4,24 +4,14 @@ xyz2stl.py
 
 Convert ASCII XYZ point cloud(s) (x y z per line) into STL surface(s).
 
-Input format (whitespace separated):
-  x y z
-  x y z
-  ...
+NEW:
+- If --merge-stl is passed, the script merges existing STL files found under ./terrain
+  into ONE combined STL WITHOUT re-processing any XYZ.
 
-Triangulation strategy:
-  1) If points form a structured grid (unique X * unique Y == N), build a grid mesh.
-     Optionally downsample the grid with --step to reduce STL size.
-  2) Otherwise, try a 2D Delaunay triangulation (requires SciPy).
-
-Output:
-  - ASCII STL by default
-  - Binary STL with --binary (much smaller)
-
-Batch mode:
-  If --all is passed, the script converts all .xyz files in ./terrain (relative to where you run it).
-  Output STL names are derived from input names (e.g. terrain.xyz -> terrain.stl) and are written
-  next to the input file (inside ./terrain).
+Notes:
+- Binary STL merge needs a two-pass write (to know triangle count). ASCII can stream.
+- This merger supports both ASCII and Binary STL inputs.
+- Output can be ASCII (default) or Binary (--binary).
 """
 
 from __future__ import annotations
@@ -40,6 +30,10 @@ class Mesh:
     vertices: np.ndarray  # (N, 3) float64
     faces: np.ndarray     # (M, 3) int64 indices into vertices
 
+
+# ----------------------------
+# Existing XYZ->STL functions
+# ----------------------------
 
 def load_xyz(path: Path) -> np.ndarray:
     """
@@ -61,14 +55,11 @@ def load_xyz(path: Path) -> np.ndarray:
             parts = s.split()
             if len(parts) < 3:
                 skipped += 1
-                continue  # skip short/non-data lines
+                continue
 
-            # Skip header lines like "X Y Z" (or any non-numeric first 3 tokens)
             try:
                 x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
             except ValueError:
-                # If it's a header (e.g. X Y Z), just ignore it; otherwise raise
-                # Heuristic: if tokens look alphabetic, treat as header
                 if parts[0].isalpha() or parts[1].isalpha() or parts[2].isalpha():
                     skipped += 1
                     continue
@@ -76,7 +67,6 @@ def load_xyz(path: Path) -> np.ndarray:
 
             pts.append((x, y, z))
 
-            # Progress print for large files
             if len(pts) % 500_000 == 0:
                 print(f"  ... parsed {len(pts):,} points (line {line_no:,})")
 
@@ -94,23 +84,9 @@ def load_xyz(path: Path) -> np.ndarray:
     return arr
 
 
-def try_structured_grid(points: np.ndarray, tol: float = 0.0, step: int = 1) -> Optional[Mesh]:
-    """
-    If points form a full X-by-Y grid (unique X * unique Y == N), build triangles
-    by cell connectivity. Works even if the file ordering is arbitrary.
-
-    step: keep every Nth point in X and Y (downsample) to reduce output size.
-    tol: optional tolerance for treating values as identical (0.0 means exact).
-    """
-    print("[2/4] Checking whether points form a structured grid...")
-
-    if step < 1:
-        raise ValueError("--step must be >= 1")
-
+def _grid_prepare(points: np.ndarray, tol: float = 0.0) -> Optional[Tuple[np.ndarray, int, int]]:
     xy = points[:, :2]
-
     if tol > 0.0:
-        # Quantize to grid for grouping (helps with tiny floating noise)
         q = np.round(xy / tol) * tol
         xs = np.unique(q[:, 0])
         ys = np.unique(q[:, 1])
@@ -122,36 +98,40 @@ def try_structured_grid(points: np.ndarray, tol: float = 0.0, step: int = 1) -> 
 
     nx, ny = xs.size, ys.size
     n = points.shape[0]
-    print(f"  Unique X: {nx:,} | Unique Y: {ny:,} | Product: {nx*ny:,} | Points: {n:,}")
-
     if nx * ny != n:
-        print("  Not a complete grid -> will fall back to Delaunay triangulation (SciPy).")
         return None
 
-    # Map each (x, y) to vertex index in a deterministic grid (iy, ix)
     xs_sorted = np.sort(xs)
     ys_sorted = np.sort(ys)
-
     ix = np.searchsorted(xs_sorted, key_xy[:, 0])
     iy = np.searchsorted(ys_sorted, key_xy[:, 1])
 
     if np.any(ix < 0) or np.any(ix >= nx) or np.any(iy < 0) or np.any(iy >= ny):
-        print("  Grid indexing failed -> fall back to Delaunay triangulation (SciPy).")
         return None
 
-    # Ensure every grid slot is filled exactly once
     grid_index = iy * nx + ix
     if np.unique(grid_index).size != n:
-        print("  Duplicate/missing grid cells detected -> fall back to Delaunay triangulation (SciPy).")
         return None
 
-    print("  Grid detected. Reordering vertices...")
-
-    # Reorder vertices into grid order so face building is straightforward
     order = np.argsort(grid_index)
     verts = points[order]
+    return verts, nx, ny
 
-    # Optional downsample
+
+def try_structured_grid(points: np.ndarray, tol: float = 0.0, step: int = 1) -> Optional[Mesh]:
+    print("[2/4] Checking whether points form a structured grid...")
+
+    if step < 1:
+        raise ValueError("--step must be >= 1")
+
+    prepared = _grid_prepare(points, tol=tol)
+    if prepared is None:
+        print("  Not a complete grid -> will fall back to Delaunay triangulation (SciPy).")
+        return None
+
+    verts, nx, ny = prepared
+    print(f"  Grid detected: {nx:,} x {ny:,} = {nx*ny:,} points")
+
     if step > 1:
         print(f"  Downsampling grid by step={step} (keeping every {step}th point in X and Y)...")
         verts_grid = verts.reshape(ny, nx, 3)
@@ -175,7 +155,6 @@ def try_structured_grid(points: np.ndarray, tol: float = 0.0, step: int = 1) -> 
             v01 = (row + 1) * nx + col
             v11 = (row + 1) * nx + (col + 1)
 
-            # Two triangles per quad. Winding chosen for +Z normals if surface is locally flat.
             faces.append((v00, v10, v11))
             faces.append((v00, v11, v01))
 
@@ -190,10 +169,6 @@ def try_structured_grid(points: np.ndarray, tol: float = 0.0, step: int = 1) -> 
 
 
 def delaunay_triangulation(points: np.ndarray) -> Mesh:
-    """
-    General triangulation using 2D Delaunay on (x, y).
-    Requires SciPy.
-    """
     print("[2/4] Running 2D Delaunay triangulation (SciPy)...")
     try:
         from scipy.spatial import Delaunay  # type: ignore
@@ -210,9 +185,6 @@ def delaunay_triangulation(points: np.ndarray) -> Mesh:
 
 
 def compute_normal(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> Tuple[float, float, float]:
-    """
-    Compute unit normal for triangle (a, b, c). If degenerate, returns (0,0,0).
-    """
     ab = b - a
     ac = c - a
     n = np.cross(ab, ac)
@@ -224,9 +196,6 @@ def compute_normal(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> Tuple[float, 
 
 
 def write_ascii_stl(mesh: Mesh, out_path: Path, solid_name: str = "terrain") -> None:
-    """
-    Writes an ASCII STL.
-    """
     print(f"[3/4] Writing ASCII STL: {out_path}")
 
     v = mesh.vertices
@@ -257,9 +226,6 @@ def write_ascii_stl(mesh: Mesh, out_path: Path, solid_name: str = "terrain") -> 
 
 
 def write_binary_stl(mesh: Mesh, out_path: Path, solid_name: str = "terrain") -> None:
-    """
-    Writes a Binary STL (much smaller than ASCII).
-    """
     print(f"[3/4] Writing Binary STL: {out_path}")
 
     v = mesh.vertices
@@ -282,7 +248,7 @@ def write_binary_stl(mesh: Mesh, out_path: Path, solid_name: str = "terrain") ->
             w.write(struct.pack("<3f", float(a[0]), float(a[1]), float(a[2])))
             w.write(struct.pack("<3f", float(b[0]), float(b[1]), float(b[2])))
             w.write(struct.pack("<3f", float(c[0]), float(c[1]), float(c[2])))
-            w.write(struct.pack("<H", 0))  # attribute byte count
+            w.write(struct.pack("<H", 0))
 
             if idx % report_every == 0 or idx == f.shape[0]:
                 pct = (idx / f.shape[0]) * 100.0
@@ -314,6 +280,191 @@ def convert_one(xyz_path: Path, stl_path: Path, *, name: str, tol: float, z_scal
     print(f"Wrote {stl_path} with {mesh.faces.shape[0]:,} triangles and {mesh.vertices.shape[0]:,} vertices.")
 
 
+# ----------------------------
+# NEW: STL merge (no XYZ)
+# ----------------------------
+
+def _list_stl_files_in_terrain() -> List[Path]:
+    folder = Path("./terrain")
+    if not folder.exists():
+        raise SystemExit(f"Folder not found: {folder.resolve()}")
+    stl_files = sorted(folder.rglob("*.stl"))
+    if not stl_files:
+        raise SystemExit(f"No .stl files found in: {folder.resolve()}")
+    return stl_files
+
+
+def _is_probably_binary_stl(path: Path) -> bool:
+    """
+    Heuristic: binary STL has 80-byte header + 4-byte tri count, and file size matches 84 + 50*n.
+    ASCII STL usually starts with 'solid'.
+    """
+    try:
+        size = path.stat().st_size
+        if size < 84:
+            return False
+        with path.open("rb") as f:
+            header = f.read(80)
+            count_bytes = f.read(4)
+        n = int.from_bytes(count_bytes, "little", signed=False)
+        expected = 84 + 50 * n
+        if expected == size:
+            return True
+        # If it starts with "solid" it's probably ASCII (not always, but common)
+        if header[:5].lower() == b"solid":
+            return False
+        # Otherwise ambiguous; prefer binary if it has valid size pattern.
+        return False
+    except Exception:
+        return False
+
+
+def _count_triangles_ascii_stl(path: Path) -> int:
+    # Count "facet normal" lines (robust enough for our files)
+    count = 0
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if line.lstrip().startswith("facet normal"):
+                count += 1
+    return count
+
+
+def _count_triangles_binary_stl(path: Path) -> int:
+    with path.open("rb") as f:
+        f.seek(80)
+        n = int.from_bytes(f.read(4), "little", signed=False)
+    return n
+
+
+def merge_stls_to_one(out_stl: Path, *, binary_out: bool, solid_name: str = "terrain_merged") -> None:
+    stl_files = _list_stl_files_in_terrain()
+    print(f"Found {len(stl_files)} STL file(s) under ./terrain")
+    print(f"Merging into: {out_stl}")
+
+    # Pass 1: count triangles (needed for binary output)
+    tri_counts: List[int] = []
+    total_tris = 0
+    if binary_out:
+        print("[MERGE] Counting triangles (required for binary STL output)...")
+        for i, p in enumerate(stl_files, 1):
+            is_bin = _is_probably_binary_stl(p)
+            n = _count_triangles_binary_stl(p) if is_bin else _count_triangles_ascii_stl(p)
+            tri_counts.append(n)
+            total_tris += n
+            print(f"  ({i}/{len(stl_files)}) {p.name}: {n:,} tris (total {total_tris:,})")
+
+        import struct
+        header = (solid_name[:80]).encode("ascii", errors="ignore").ljust(80, b"\0")
+        with out_stl.open("wb") as out:
+            out.write(header)
+            out.write(struct.pack("<I", int(total_tris)))
+
+            written = 0
+            report_every = max(1, total_tris // 20)
+
+            for i, p in enumerate(stl_files, 1):
+                print("\n" + "=" * 80)
+                print(f"[MERGE] ({i}/{len(stl_files)}) Appending {p}")
+                print("=" * 80)
+
+                if _is_probably_binary_stl(p):
+                    with p.open("rb") as f:
+                        f.seek(80)
+                        n = int.from_bytes(f.read(4), "little", signed=False)
+                        # Copy 50*n bytes (each triangle record)
+                        chunk = f.read(50 * n)
+                        out.write(chunk)
+                        written += n
+                else:
+                    # Parse ASCII STL and write as binary triangles
+                    with p.open("r", encoding="utf-8", errors="ignore") as f:
+                        tri_vertices: List[Tuple[float, float, float]] = []
+                        for line in f:
+                            s = line.strip()
+                            if s.startswith("vertex"):
+                                parts = s.split()
+                                if len(parts) >= 4:
+                                    tri_vertices.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                                    if len(tri_vertices) == 3:
+                                        a = np.array(tri_vertices[0], dtype=np.float64)
+                                        b = np.array(tri_vertices[1], dtype=np.float64)
+                                        c = np.array(tri_vertices[2], dtype=np.float64)
+                                        nx, ny, nz = compute_normal(a, b, c)
+
+                                        out.write(struct.pack("<3f", float(nx), float(ny), float(nz)))
+                                        out.write(struct.pack("<3f", float(a[0]), float(a[1]), float(a[2])))
+                                        out.write(struct.pack("<3f", float(b[0]), float(b[1]), float(b[2])))
+                                        out.write(struct.pack("<3f", float(c[0]), float(c[1]), float(c[2])))
+                                        out.write(struct.pack("<H", 0))
+
+                                        tri_vertices.clear()
+                                        written += 1
+
+                if written % report_every == 0 or written == total_tris:
+                    pct = (written / total_tris) * 100.0
+                    print(f"[MERGE] Progress: {written:,}/{total_tris:,} triangles ({pct:.0f}%)")
+
+        print(f"[MERGE] Done. Wrote {out_stl} with {total_tris:,} triangles.")
+        return
+
+    # ASCII output: stream facets as ASCII (no need to pre-count)
+    print("[MERGE] Writing combined ASCII STL (streaming)...")
+    with out_stl.open("w", encoding="utf-8") as out:
+        out.write(f"solid {solid_name}\n")
+        total_tris_streamed = 0
+
+        for i, p in enumerate(stl_files, 1):
+            print("\n" + "=" * 80)
+            print(f"[MERGE] ({i}/{len(stl_files)}) Appending {p}")
+            print("=" * 80)
+
+            if _is_probably_binary_stl(p):
+                # Convert binary triangles to ASCII facets
+                with p.open("rb") as f:
+                    f.seek(80)
+                    n = int.from_bytes(f.read(4), "little", signed=False)
+                    import struct
+                    for _ in range(n):
+                        rec = f.read(50)
+                        if len(rec) != 50:
+                            break
+                        # <3f normal, <9f vertices, <H attr
+                        vals = struct.unpack("<12fH", rec)
+                        # Ignore stored normal; recompute for safety
+                        ax, ay, az, bx, by, bz, cx, cy, cz = vals[3], vals[4], vals[5], vals[6], vals[7], vals[8], vals[9], vals[10], vals[11]
+                        a = np.array([ax, ay, az], dtype=np.float64)
+                        b = np.array([bx, by, bz], dtype=np.float64)
+                        c = np.array([cx, cy, cz], dtype=np.float64)
+                        nx, ny, nz = compute_normal(a, b, c)
+
+                        out.write(f"  facet normal {nx:.8e} {ny:.8e} {nz:.8e}\n")
+                        out.write("    outer loop\n")
+                        out.write(f"      vertex {a[0]:.8e} {a[1]:.8e} {a[2]:.8e}\n")
+                        out.write(f"      vertex {b[0]:.8e} {b[1]:.8e} {b[2]:.8e}\n")
+                        out.write(f"      vertex {c[0]:.8e} {c[1]:.8e} {c[2]:.8e}\n")
+                        out.write("    endloop\n")
+                        out.write("  endfacet\n")
+                        total_tris_streamed += 1
+            else:
+                # Copy ASCII facets as-is
+                with p.open("r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        s = line.strip()
+                        if s.startswith("solid") or s.startswith("endsolid"):
+                            continue
+                        out.write(line)
+                        if s.startswith("facet normal"):
+                            total_tris_streamed += 1
+
+        out.write(f"endsolid {solid_name}\n")
+
+    print(f"[MERGE] Done. Wrote {out_stl} with ~{total_tris_streamed:,} triangles.")
+
+
+# ----------------------------
+# Main CLI
+# ----------------------------
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Convert XYZ terrain point cloud(s) to STL surface(s).")
     ap.add_argument(
@@ -321,6 +472,12 @@ def main() -> None:
         action="store_true",
         help="Convert all .xyz files in ./terrain (relative to the current working directory).",
     )
+    ap.add_argument(
+        "--merge-stl",
+        action="store_true",
+        help="Merge existing .stl files found under ./terrain into one combined STL (no XYZ processing).",
+    )
+
     ap.add_argument("xyz", nargs="?", type=Path, help="Input XYZ file (x y z per line)")
     ap.add_argument("stl", nargs="?", type=Path, help="Output STL file")
 
@@ -352,12 +509,24 @@ def main() -> None:
     )
     args = ap.parse_args()
 
+    if args.merge_stl:
+        out_path = args.stl if args.stl is not None else args.xyz
+        if out_path is None:
+            ap.error("With --merge-stl you must provide the output STL path (e.g. merged_terrain.stl).")
+        merge_stls_to_one(
+            Path(out_path),
+            binary_out=bool(args.binary),
+            solid_name=str(args.name) if args.name else "terrain_merged",
+        )
+        return
+
+
     if args.all:
         folder = Path("./terrain")
         if not folder.exists():
             raise SystemExit(f"Folder not found: {folder.resolve()}")
 
-        xyz_files = sorted(folder.glob("*.xyz"))
+        xyz_files = sorted(folder.rglob("*.xyz"))
         if not xyz_files:
             raise SystemExit(f"No .xyz files found in: {folder.resolve()}")
 
@@ -365,19 +534,23 @@ def main() -> None:
         for xyz_path in xyz_files:
             stl_path = xyz_path.with_suffix(".stl")
             per_file_name = xyz_path.stem
-            convert_one(
-                xyz_path,
-                stl_path,
-                name=per_file_name,
-                tol=float(args.tol),
-                z_scale=float(args.z_scale),
-                step=int(args.step),
-                binary=bool(args.binary),
-            )
+            try:
+                convert_one(
+                    xyz_path,
+                    stl_path,
+                    name=per_file_name,
+                    tol=float(args.tol),
+                    z_scale=float(args.z_scale),
+                    step=int(args.step),
+                    binary=bool(args.binary),
+                )
+            except Exception as e:
+                print(f"ERROR converting {xyz_path}: {e}")
+                continue
         return
 
     if args.xyz is None or args.stl is None:
-        ap.error("Either provide xyz stl arguments, or run with --all to convert all .xyz files in ./terrain.")
+        ap.error("Provide xyz stl arguments, or use --all, or use --merge-stl <out.stl>.")
 
     convert_one(
         args.xyz,
@@ -392,263 +565,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-# XYZ → STL Terrain Converter
-
-This tool converts terrain point clouds stored as `.xyz` files into STL surface meshes.
-It is designed for **large gridded terrain datasets** (e.g. 0.5 m resolution, 1 km × 1 km)
-and includes options to **reduce file size** and **batch-process many files**.
-
----
-
-## Input format
-
-Each `.xyz` file must be plain text with one point per line:
-
-```
-X Y Z
-793483.25 1139000.25 3602.40
-793483.75 1139000.25 3602.23
-...
-```
-
-Notes:
-
-* A header line like `X Y Z` is allowed
-* Blank lines and `#` comments are ignored
-* Coordinates must form a **complete X/Y grid** for best results
-
----
-
-## Requirements
-
-* Python (tested with conda environments)
-* NumPy (required)
-* SciPy (only needed if grid detection fails)
-
-Install dependencies (recommended with conda):
-
-```
-conda install numpy scipy
-```
-
----
-
-## Folder structure (recommended)
-
-```
-project/
-├─ build_stl.py
-├─ terrain/
-│  ├─ tile_001.xyz
-│  ├─ tile_002.xyz
-│  └─ ...
-```
-
-All batch operations assume `.xyz` files live in the `./terrain` folder.
-
----
-
-## Basic usage
-
-### 1) Convert a single file
-
-```
-python build_stl.py input.xyz output.stl
-```
-
-This:
-
-* Reads `input.xyz`
-* Builds a terrain surface
-* Writes `output.stl` (ASCII STL by default)
-
----
-
-### 2) Convert all XYZ files in `./terrain/` (batch mode)
-
-```
-python build_stl.py --all
-```
-
-This:
-
-* Looks for all `.xyz` files inside `./terrain`
-* Converts each file independently
-* Writes `file.stl` next to `file.xyz`
-
-Example:
-
-```
-terrain/
- ├─ tile_001.xyz → tile_001.stl
- ├─ tile_002.xyz → tile_002.stl
-```
-
----
-
-## Important options (you will usually want these)
-
-### `--binary` (strongly recommended)
-
-Writes **Binary STL** instead of ASCII.
-Binary STL files are **10–20× smaller**.
-
-```
---binary
-```
-
-Example:
-
-```
-python build_stl.py --all --binary
-```
-
----
-
-### `--step N` (reduce mesh size)
-
-Downsamples the terrain grid by keeping every `N`th point in X and Y.
-
-Your data: **0.5 m resolution**
-
-| Step | Effective resolution | Use case                |
-| ---- | -------------------- | ----------------------- |
-| 1    | 0.5 m                | Very detailed, huge STL |
-| 2    | 1.0 m                | High detail             |
-| 4    | 2.0 m                | Good balance            |
-| 10   | 5.0 m                | Very manageable         |
-
-Example (recommended for large areas):
-
-```
-python build_stl.py --all --step 10 --binary
-```
-
----
-
-### `--tol` (grid tolerance)
-
-If grid detection fails due to tiny floating-point noise in X/Y coordinates,
-use a tolerance to snap points together.
-
-Typical values:
-
-```
---tol 0.001
---tol 0.01
-```
-
-Example:
-
-```
-python build_stl.py --all --tol 0.001 --step 10 --binary
-```
-
----
-
-### `--z-scale` (vertical scaling)
-
-Multiplies all Z values.
-
-Examples:
-
-* exaggerate terrain: `--z-scale 2`
-* reduce vertical scale: `--z-scale 0.5`
-
-```
-python build_stl.py input.xyz output.stl --z-scale 2 --binary
-```
-
----
-
-### `--name` (single-file mode only)
-
-Sets the STL “solid name” inside the file.
-
-```
-python build_stl.py input.xyz output.stl --name MyTerrain
-```
-
-In batch mode (`--all`), the filename is used automatically.
-
----
-
-## How triangulation works (automatic)
-
-You do **not** select this manually.
-
-1. **Structured grid mode (preferred)**
-
-   * Used when `unique X × unique Y == number of points`
-   * Fast, predictable, supports `--step`
-
-2. **Delaunay triangulation (fallback)**
-
-   * Used if the grid is incomplete or irregular
-   * Requires SciPy
-   * `--step` is ignored in this mode
-
-The script prints which mode is used.
-
----
-
-## Recommended commands (most users)
-
-### Large terrain tiles (best balance)
-
-```
-python build_stl.py --all --step 10 --binary
-```
-
-### Higher detail terrain
-
-```
-python build_stl.py --all --step 4 --binary
-```
-
-### Debug a single tile
-
-```
-python build_stl.py terrain/tile_001.xyz terrain/tile_001.stl --step 4
-```
-
----
-
-## Output size expectations (1 km × 1 km)
-
-Approximate triangle counts:
-
-| Step | Triangles  |
-| ---- | ---------- |
-| 1    | ~8 million |
-| 2    | ~2 million |
-| 4    | ~500k      |
-| 10   | ~80k       |
-
-Binary STL at `step=10` is usually **a few MB**.
-
----
-
-## Troubleshooting
-
-### “Not a complete grid → Delaunay”
-
-* Try adding `--tol 0.001`
-* Check for missing points in the XYZ file
-
-### “SciPy not available”
-
-```
-conda install scipy
-```
-
-### Very slow or huge STL
-
-* Increase `--step`
-* Always use `--binary`
-
----
-
-## License / Usage
-
-Free to use, modify, and adapt for terrain processing, GIS, CAD, or 3D printing workflows.
