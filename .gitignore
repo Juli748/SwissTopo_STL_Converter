@@ -5,7 +5,7 @@ terrain/
 *.stl
 
 # Optional: ignore binary STL backups or temp files
-*.stl~
+# *.stl~
 
 # Python cache (safe to include)
 __pycache__/
