@@ -1,5 +1,6 @@
 # Ignore all terrain input data
 terrain/
+Download/terrain_temp/
 
 # Ignore all generated STL files
 *.stl
