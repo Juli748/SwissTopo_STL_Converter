@@ -9,14 +9,17 @@ It is designed for large, gridded terrain datasets and supports batch conversion
 
 1) Download XYZ tiles
 - Get terrain tiles as XYZ (X Y Z per line).
-- If you have a CSV of download URLs in ./Download, run:
+- If you have a CSV of download URLs from SwissTopo, put it in ./Download and run:
 
 ```
 python download_tiles.py
 ```
 
 - This downloads ZIPs into ./Download/zips_temp, unzips to ./Download/terrain_temp, and removes the ZIPs.
-- Move the unzipped .xyz files into ./terrain.
+- This program wil ask if all the XYZs should be moved into /terrain:
+```
+Copy unzipped files into ./terrain for processing? [y/N]: y
+````
 
 Swisstopo sources:
 - swissALTI3D (DTM): https://www.swisstopo.admin.ch/de/hoehenmodell-swissalti3d
