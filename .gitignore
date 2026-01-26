@@ -1,6 +1,5 @@
-# Ignore all terrain input data
-terrain/
-Download/terrain_temp/
+# Ignore all input data
+data/
 
 # Ignore all generated STL files
 *.stl
@@ -11,6 +10,9 @@ Download/terrain_temp/
 # Python cache (safe to include)
 __pycache__/
 *.pyc
+
+# Outputs
+output/
 
 # OS junk
 .DS_Store

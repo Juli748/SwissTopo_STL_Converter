@@ -55,31 +55,26 @@ def clear_directory(directory):
 
 def main():
     repo_root = Path(__file__).resolve().parent
-    downloads_dir = repo_root / "Download"
-    if not downloads_dir.exists():
-        print(f"Missing downloads folder: {downloads_dir}")
-        return 1
-
-    csv_files = sorted(downloads_dir.glob("*.csv"))
+    data_dir = repo_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    csv_files = sorted(data_dir.glob("*.csv"))
     if not csv_files:
-        print(f"No CSV files found in: {downloads_dir}")
+        print(f"No CSV files found in: {data_dir}")
         return 1
 
-    extract_dir = downloads_dir / "terrain_temp"
+    extract_dir = data_dir / "_extract_temp"
     extract_dir.mkdir(parents=True, exist_ok=True)
-    zips_temp_dir = downloads_dir / "zips_temp"
+    zips_temp_dir = data_dir / "_zips_temp"
     zips_temp_dir.mkdir(parents=True, exist_ok=True)
     clear_directory(extract_dir)
     clear_directory(zips_temp_dir)
-    terrain_dir = repo_root / "terrain"
-    terrain_dir.mkdir(parents=True, exist_ok=True)
-    existing_terrain_files = [p for p in terrain_dir.iterdir() if p.is_file()]
-    if existing_terrain_files:
-        response = input(
-            "Existing files found in ./terrain. Delete them before copying? [y/N]: "
-        ).strip().lower()
+    xyz_dir = data_dir / "xyz"
+    xyz_dir.mkdir(parents=True, exist_ok=True)
+    existing_xyz_files = [p for p in xyz_dir.iterdir() if p.is_file()]
+    if existing_xyz_files:
+        response = input("Existing files found in ./data/xyz. Delete them? [y/N]: ").strip().lower()
         if response in {"y", "yes"}:
-            for file_path in existing_terrain_files:
+            for file_path in existing_xyz_files:
                 try:
                     file_path.unlink()
                 except OSError:
@@ -115,16 +110,12 @@ def main():
     except OSError:
         pass
 
-    response = input(
-        "Copy unzipped files into ./terrain for processing? [y/N]: "
-    ).strip().lower()
-    if response in {"y", "yes"}:
-        copied = 0
-        for file_path in extract_dir.glob("*"):
-            if file_path.is_file():
-                shutil.copy2(file_path, terrain_dir / file_path.name)
-                copied += 1
-        print(f"Copied {copied} files to {terrain_dir}")
+    copied = 0
+    for file_path in extract_dir.rglob("*.xyz"):
+        if file_path.is_file():
+            shutil.copy2(file_path, xyz_dir / file_path.name)
+            copied += 1
+    print(f"Copied {copied} XYZ files to {xyz_dir}")
 
     print("Done.")
     return 0

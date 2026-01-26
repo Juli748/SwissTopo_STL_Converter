@@ -5,7 +5,7 @@ xyz2stl.py
 Convert ASCII XYZ point cloud(s) (x y z per line) into STL surface(s).
 
 NEW:
-- If --merge-stl is passed, the script merges existing STL files found under ./terrain
+- If --merge-stl is passed, the script merges existing STL files found under ./output/tiles
   into ONE combined STL WITHOUT re-processing any XYZ.
 
 Notes:
@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import math
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -94,6 +95,127 @@ def load_xyz(path: Path) -> np.ndarray:
     print(f"  Bounds Z: {mins[2]:.3f} .. {maxs[2]:.3f}")
 
     return arr
+
+
+def _min_spacing(values: List[float]) -> Optional[float]:
+    if len(values) < 2:
+        return None
+    values_sorted = sorted(values)
+    diffs = [b - a for a, b in zip(values_sorted, values_sorted[1:]) if b > a]
+    if not diffs:
+        return None
+    return min(diffs)
+
+
+def scan_xyz_bounds_and_resolution(
+    xyz_files: List[Path],
+    *,
+    round_decimals: int = 6,
+) -> Tuple[float, float, float, float, float]:
+    min_x = float("inf")
+    max_x = float("-inf")
+    min_y = float("inf")
+    max_y = float("-inf")
+    min_spacing = float("inf")
+
+    for path in xyz_files:
+        print(f"[AUTO] Scanning XYZ: {path}")
+        xs: set[float] = set()
+        ys: set[float] = set()
+        skipped = 0
+        with path.open("r", encoding="utf-8", errors="ignore") as f:
+            for line_no, line in enumerate(f, 1):
+                s = line.strip()
+                if not s or s.startswith("#"):
+                    skipped += 1
+                    continue
+
+                parts = s.split()
+                if len(parts) < 3:
+                    skipped += 1
+                    continue
+
+                try:
+                    x, y = float(parts[0]), float(parts[1])
+                except ValueError:
+                    if parts[0].isalpha() or parts[1].isalpha():
+                        skipped += 1
+                        continue
+                    raise ValueError(f"{path}:{line_no}: could not parse floats: {s}")
+
+                min_x = min(min_x, x)
+                max_x = max(max_x, x)
+                min_y = min(min_y, y)
+                max_y = max(max_y, y)
+
+                xs.add(round(x, round_decimals))
+                ys.add(round(y, round_decimals))
+
+        dx = _min_spacing(list(xs))
+        dy = _min_spacing(list(ys))
+        spacing_candidates = [v for v in (dx, dy) if v is not None and v > 0]
+        file_spacing = min(spacing_candidates) if spacing_candidates else None
+        if file_spacing is not None:
+            min_spacing = min(min_spacing, file_spacing)
+        print(f"[AUTO]  Skipped {skipped:,} lines")
+
+    if not math.isfinite(min_x) or not math.isfinite(min_y):
+        raise ValueError("No valid points found while scanning XYZ files.")
+
+    if not math.isfinite(min_spacing):
+        raise ValueError("Could not determine XY resolution from XYZ files.")
+
+    return min_x, max_x, min_y, max_y, min_spacing
+
+
+def _prompt_optional_float(prompt: str) -> Optional[float]:
+    while True:
+        raw = input(prompt).strip()
+        if raw == "":
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            print("Please enter a numeric value.")
+            continue
+        if value <= 0:
+            print("Value must be greater than zero.")
+            continue
+        return value
+
+
+def _auto_scale_and_step(
+    xyz_files: List[Path],
+    *,
+    target_size_mm: float,
+    target_resolution_mm: float,
+) -> Tuple[float, int]:
+    min_x, max_x, min_y, max_y, min_spacing = scan_xyz_bounds_and_resolution(xyz_files)
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+    min_edge = min(span_x, span_y)
+    if min_edge <= 0:
+        raise ValueError("Combined XY bounds have zero size.")
+
+    scale = float(target_size_mm) / float(min_edge)
+    spacing_mm = min_spacing * scale
+    if spacing_mm <= 0:
+        raise ValueError("Computed spacing is not positive; check XYZ resolution.")
+
+    if target_resolution_mm <= 0:
+        raise ValueError("Target resolution must be > 0.")
+
+    step = max(1, int(math.ceil(target_resolution_mm / spacing_mm)))
+
+    print(f"[AUTO] Combined X span: {span_x:.3f}")
+    print(f"[AUTO] Combined Y span: {span_y:.3f}")
+    print(f"[AUTO] Min XY spacing: {min_spacing:.6f}")
+    print(f"[AUTO] Target min edge: {target_size_mm:.2f} mm")
+    print(f"[AUTO] Scale factor: {scale:.6f} (input units -> mm)")
+    print(f"[AUTO] Target XY spacing: {target_resolution_mm:.2f} mm")
+    print(f"[AUTO] Output XY spacing: {spacing_mm:.3f} mm -> step={step}")
+
+    return scale, step
 
 
 def _grid_prepare(points: np.ndarray, tol: float = 0.0) -> Optional[Tuple[np.ndarray, int, int]]:
@@ -492,6 +614,19 @@ def make_solid(mesh: Mesh, base_z: float) -> Mesh:
 
 
 # ----------------------------
+# Scaling
+# ----------------------------
+
+def scale_mesh_z(mesh: Mesh, z_scale: float) -> Mesh:
+    if z_scale == 1.0:
+        return mesh
+    print(f"[SCALE] Scaling Z by {z_scale}")
+    v = mesh.vertices.copy()
+    v[:, 2] *= float(z_scale)
+    return Mesh(vertices=v, faces=mesh.faces)
+
+
+# ----------------------------
 # Conversion helpers
 # ----------------------------
 
@@ -502,6 +637,7 @@ def convert_one(
     name: str,
     tol: float,
     z_scale: float,
+    scale: float,
     step: int,
     binary: bool,
     make_solid_flag: bool,
@@ -514,6 +650,10 @@ def convert_one(
     print("=" * 80)
 
     pts = load_xyz(xyz_path)
+    if scale != 1.0:
+        print(f"[1/4] Applying scale: {scale}")
+        pts = pts.copy()
+        pts *= float(scale)
     if z_scale != 1.0:
         print(f"[1/4] Applying Z scale: {z_scale}")
         pts = pts.copy()
@@ -538,8 +678,8 @@ def convert_one(
     print(f"Wrote {stl_path} with {mesh.faces.shape[0]:,} triangles and {mesh.vertices.shape[0]:,} vertices.")
 
 
-def _list_xyz_files_in_terrain() -> List[Path]:
-    folder = Path("./terrain")
+def _list_xyz_files() -> List[Path]:
+    folder = Path("./data/xyz")
     if not folder.exists():
         raise SystemExit(f"Folder not found: {folder.resolve()}")
     xyz_files = sorted(folder.rglob("*.xyz"))
@@ -548,8 +688,8 @@ def _list_xyz_files_in_terrain() -> List[Path]:
     return xyz_files
 
 
-def _list_stl_files_in_terrain() -> List[Path]:
-    folder = Path("./terrain")
+def _list_stl_files() -> List[Path]:
+    folder = Path("./output/tiles")
     if not folder.exists():
         raise SystemExit(f"Folder not found: {folder.resolve()}")
     stl_files = sorted(folder.rglob("*.stl"))
@@ -567,8 +707,8 @@ def merge_stls_streaming(out_stl: Path, *, binary_out: bool, solid_name: str = "
     Fast merge that simply concatenates triangles.
     Does not load the whole mesh. Cannot do global solidification.
     """
-    stl_files = _list_stl_files_in_terrain()
-    print(f"Found {len(stl_files)} STL file(s) under ./terrain")
+    stl_files = _list_stl_files()
+    print(f"Found {len(stl_files)} STL file(s) under ./output/tiles")
     print(f"Merging into: {out_stl}")
 
     if binary_out:
@@ -700,12 +840,13 @@ def merge_stls_mesh(
     make_solid_flag: bool,
     base_thickness_value: float,
     base_z_value: Optional[float],
+    z_scale: float,
 ) -> None:
     """
     Full merge that loads all tiles into memory, welds vertices, and can solidify globally.
     """
-    stl_files = _list_stl_files_in_terrain()
-    print(f"Found {len(stl_files)} STL file(s) under ./terrain")
+    stl_files = _list_stl_files()
+    print(f"Found {len(stl_files)} STL file(s) under ./output/tiles")
     print(f"[MERGE-MESH] Output: {out_stl}")
 
     meshes: List[Mesh] = []
@@ -720,6 +861,9 @@ def merge_stls_mesh(
 
     # Welding is the key to removing internal tile boundaries
     merged = weld_vertices(merged, weld_tol=float(weld_tol))
+
+    if z_scale != 1.0:
+        merged = scale_mesh_z(merged, float(z_scale))
 
     if make_solid_flag:
         if base_z_value is None:
@@ -745,19 +889,15 @@ def main() -> None:
     ap.add_argument(
         "--all",
         action="store_true",
-        help="Convert all .xyz files in ./terrain (relative to the current working directory).",
+        help="Convert all .xyz files in ./data/xyz into ./output/tiles.",
     )
     ap.add_argument(
         "--merge-stl",
-        action="store_true",
-        help="Merge existing .stl files found under ./terrain into one combined STL (no XYZ processing). "
-             "Welds shared vertices for seamless joins.",
+        type=Path,
+        default=None,
+        help="Merge existing .stl files found under ./output/tiles into one combined STL (no XYZ processing).",
     )
 
-    ap.add_argument("xyz", nargs="?", type=Path, help="Input XYZ file (x y z per line)")
-    ap.add_argument("stl", nargs="?", type=Path, help="Output STL file")
-
-    ap.add_argument("--name", default="terrain", help="STL solid name (default: terrain)")
     ap.add_argument(
         "--tol",
         type=float,
@@ -772,6 +912,12 @@ def main() -> None:
         help="Multiply Z by this factor (default: 1.0)",
     )
     ap.add_argument(
+        "--merge-z-scale",
+        type=float,
+        default=1.0,
+        help="Multiply Z by this factor when using --merge-stl (default: 1.0).",
+    )
+    ap.add_argument(
         "--step",
         type=int,
         default=1,
@@ -779,23 +925,18 @@ def main() -> None:
              "Example: step=10 turns 0.5m spacing into 5m spacing.",
     )
     ap.add_argument(
-        "--no-assume-grid",
-        action="store_true",
-        help="Disable grid assumption and allow Delaunay fallback. "
-             "Use this if the XYZ data is not a complete grid.",
+        "--target-size-mm",
+        type=float,
+        default=None,
+        help="Target size of the smallest XY edge in mm. "
+             "When set in --all mode, auto-compute scale and step from XYZ bounds/resolution.",
     )
-    format_group = ap.add_mutually_exclusive_group()
-    format_group.add_argument(
-        "--ascii",
-        action="store_true",
-        help="Write ASCII STL instead of Binary (Binary is default).",
+    ap.add_argument(
+        "--target-resolution-mm",
+        type=float,
+        default=0.3,
+        help="Target XY point spacing in the final STL (mm) when using --target-size-mm (default: 0.3).",
     )
-    format_group.add_argument(
-        "--binary",
-        action="store_true",
-        help="Write Binary STL (default; provided for explicitness).",
-    )
-
     ap.add_argument(
         "--make-solid",
         action="store_true",
@@ -826,20 +967,20 @@ def main() -> None:
 
     args = ap.parse_args()
 
-    if args.merge_stl:
-        out_path = args.stl if args.stl is not None else args.xyz
-        if out_path is None:
-            ap.error("With --merge-stl you must provide the output STL path (e.g. merged_terrain.stl).")
+    if args.target_size_mm is not None and not args.all:
+        ap.error("--target-size-mm can only be used with --all.")
 
+    if args.merge_stl is not None:
         # Load + weld for seamless joins; solidify once globally if requested.
         merge_stls_mesh(
-            Path(out_path),
-            binary_out=not bool(args.ascii),
-            solid_name=str(args.name) if args.name else "terrain_merged",
+            Path(args.merge_stl),
+            binary_out=True,
+            solid_name="terrain_merged",
             weld_tol=float(args.weld_tol),
             make_solid_flag=bool(args.make_solid),
             base_thickness_value=float(args.base_thickness),
             base_z_value=args.base_z,
+            z_scale=float(args.merge_z_scale),
         )
         return
 
@@ -847,11 +988,30 @@ def main() -> None:
         if bool(args.make_solid):
             print("[WARN] --make-solid is ignored in --all mode. "
                   "Use --merge-stl --make-solid to add a global base after merging.")
-        xyz_files = _list_xyz_files_in_terrain()
-        print(f"Found {len(xyz_files)} .xyz file(s) in {Path('./terrain').resolve()}")
+
+        xyz_files = _list_xyz_files()
+        print(f"Found {len(xyz_files)} .xyz file(s) in {Path('./data/xyz').resolve()}")
+
+        target_size_mm = args.target_size_mm
+        if target_size_mm is None and args.step == 1 and sys.stdin.isatty():
+            target_size_mm = _prompt_optional_float(
+                "Target smallest edge length in mm (blank to keep --step 1): "
+            )
+
+        auto_scale = 1.0
+        auto_step = int(args.step)
+        if target_size_mm is not None:
+            auto_scale, auto_step = _auto_scale_and_step(
+                xyz_files,
+                target_size_mm=float(target_size_mm),
+                target_resolution_mm=float(args.target_resolution_mm),
+            )
+
+        output_tiles_dir = Path("./output/tiles")
+        output_tiles_dir.mkdir(parents=True, exist_ok=True)
 
         for xyz_path in xyz_files:
-            stl_path = xyz_path.with_suffix(".stl")
+            stl_path = output_tiles_dir / f"{xyz_path.stem}.stl"
             per_file_name = xyz_path.stem
             try:
                 convert_one(
@@ -860,34 +1020,20 @@ def main() -> None:
                     name=per_file_name,
                     tol=float(args.tol),
                     z_scale=float(args.z_scale),
-                    step=int(args.step),
-                    binary=not bool(args.ascii),
+                    scale=float(auto_scale),
+                    step=int(auto_step),
+                    binary=True,
                     make_solid_flag=False,
                     base_thickness_value=float(args.base_thickness),
                     base_z_value=args.base_z,
-                    assume_grid=not bool(args.no_assume_grid),
+                    assume_grid=True,
                 )
             except Exception as e:
                 print(f"ERROR converting {xyz_path}: {e}")
                 continue
         return
 
-    if args.xyz is None or args.stl is None:
-        ap.error("Provide xyz stl arguments, or use --all, or use --merge-stl <out.stl>.")
-
-    convert_one(
-        args.xyz,
-        args.stl,
-        name=str(args.name),
-        tol=float(args.tol),
-        z_scale=float(args.z_scale),
-        step=int(args.step),
-        binary=not bool(args.ascii),
-        make_solid_flag=bool(args.make_solid),
-        base_thickness_value=float(args.base_thickness),
-        base_z_value=args.base_z,
-        assume_grid=not bool(args.no_assume_grid),
-    )
+    ap.error("Use --all to convert tiles or --merge-stl <out.stl> to merge.")
 
 
 if __name__ == "__main__":
