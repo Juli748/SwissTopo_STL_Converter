@@ -26,47 +26,44 @@ python gui.py
 
 ---
 
-## Setup so it just works (no Python knowledge needed)
+## Setup so it just works (Windows only)
 
-Follow these steps once on each computer. After that, you can launch the GUI with a double-click or one command.
+Follow these steps once on each Windows computer. After that, you can launch the GUI with a double-click or one command.
 
 **1) Install Python (once)**
 - Install **Python 3.10+** from python.org.
-- During install, check **“Add Python to PATH”**.
+- During install, check **"Add Python to PATH"**.
 
 **2) Get the project**
 - Option A: Download the ZIP from GitHub and extract it.
 - Option B: Use Git to clone the repo (optional).
 
 **3) Install the required packages (once per machine)**
-
-Windows (PowerShell):
 ```bash
 py -3 -m pip install --upgrade pip
 py -3 -m pip install numpy
 ```
 
-macOS / Linux (Terminal):
-```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install numpy
-```
-
 Optional (only needed if your XYZ is not a perfect grid and you need triangulation fallback):
 ```bash
-python3 -m pip install scipy
+py -3 -m pip install scipy
+```
+
+**Optional: Use Conda instead of the system Python**
+```bash
+conda create -n swisstopo-stl python=3.11 -y
+conda activate swisstopo-stl
+python -m pip install --upgrade pip
+python -m pip install numpy
+```
+Optional SciPy (only if you need triangulation fallback):
+```bash
+python -m pip install scipy
 ```
 
 **4) Start the GUI**
-
-Windows:
 ```bash
 py -3 gui.py
-```
-
-macOS / Linux:
-```bash
-python3 gui.py
 ```
 
 ---
