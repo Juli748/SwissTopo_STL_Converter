@@ -1,0 +1,18 @@
+DEFAULTS = {
+    "window_title": "SwissTopo STL Converter",
+    "window_geometry": "900x700",
+    "csv_path": "",
+    "mode": "auto",
+    "target_size_mm": "100",
+    "target_resolution_mm": "0.3",
+    "step": "1",
+    "grid_tolerance": "0.0",
+    "z_scale": "1.0",
+    "merge_out": "output/terrain.stl",
+    "weld_tolerance": "0.01",
+    "merge_z_scale": "1.0",
+    "make_solid": True,
+    "base_thickness": "5.0",
+    "base_z": "",
+    "status_idle": "",
+}

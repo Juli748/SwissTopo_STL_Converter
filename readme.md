@@ -7,6 +7,11 @@ It is designed for large, gridded terrain datasets and supports batch conversion
 
 ## Quick Start (recommended workflow)
 
+GUI (guided workflow):
+```
+python gui.py
+```
+
 1) Download XYZ tiles
 - Get terrain tiles as XYZ (X Y Z per line).
 - Put your CSV of download URLs in `./data` and run:
