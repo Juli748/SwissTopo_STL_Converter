@@ -1,11 +1,72 @@
 # SwissTopo STL Converter (GUI-first)
 
+## Get the SwissTopo CSV (first step)
+
+Download the CSV of swissALTI3D tiles from SwissTopo and place it into `data/` (recommended). The GUI can also browse to the CSV anywhere on disk and optionally copy it into `data/`.
+
+1) Open the swissALTI3D page and select the tiles you want.
+2) Export/download the CSV from the selection.
+3) Save the CSV into `data/` (next to this README) so the GUI picks it up automatically.
+
+![SwissTopo selection](images/selection.png)
+![Download CSV](images/download_csv.png)
+
+Source page:
+```
+https://www.swisstopo.admin.ch/de/hoehenmodell-swissalti3d
+```
+
 This project is built around the GUI. Use it to download SwissTopo XYZ tiles, convert them into STL tiles, and merge them into a single printable STL with optional base.
 
 Run the GUI:
 
 ```bash
 python gui.py
+```
+
+---
+
+## Setup so it just works (no Python knowledge needed)
+
+Follow these steps once on each computer. After that, you can launch the GUI with a double-click or one command.
+
+**1) Install Python (once)**
+- Install **Python 3.10+** from python.org.
+- During install, check **“Add Python to PATH”**.
+
+**2) Get the project**
+- Option A: Download the ZIP from GitHub and extract it.
+- Option B: Use Git to clone the repo (optional).
+
+**3) Install the required packages (once per machine)**
+
+Windows (PowerShell):
+```bash
+py -3 -m pip install --upgrade pip
+py -3 -m pip install numpy
+```
+
+macOS / Linux (Terminal):
+```bash
+python3 -m pip install --upgrade pip
+python3 -m pip install numpy
+```
+
+Optional (only needed if your XYZ is not a perfect grid and you need triangulation fallback):
+```bash
+python3 -m pip install scipy
+```
+
+**4) Start the GUI**
+
+Windows:
+```bash
+py -3 gui.py
+```
+
+macOS / Linux:
+```bash
+python3 gui.py
 ```
 
 ---

@@ -964,6 +964,12 @@ def main() -> None:
         help="Vertex weld tolerance used for merge/solidify (default: 0.001). "
              "Use something like 0.001 or 0.01 to remove tile seams.",
     )
+    ap.add_argument(
+        "--model-name",
+        type=str,
+        default="",
+        help="Optional model name used for output naming and STL solid name.",
+    )
 
     args = ap.parse_args()
 
@@ -972,10 +978,11 @@ def main() -> None:
 
     if args.merge_stl is not None:
         # Load + weld for seamless joins; solidify once globally if requested.
+        merge_name = args.model_name.strip() or "terrain_merged"
         merge_stls_mesh(
             Path(args.merge_stl),
             binary_out=True,
-            solid_name="terrain_merged",
+            solid_name=merge_name,
             weld_tol=float(args.weld_tol),
             make_solid_flag=bool(args.make_solid),
             base_thickness_value=float(args.base_thickness),
@@ -1011,8 +1018,13 @@ def main() -> None:
         output_tiles_dir.mkdir(parents=True, exist_ok=True)
 
         for xyz_path in xyz_files:
-            stl_path = output_tiles_dir / f"{xyz_path.stem}.stl"
-            per_file_name = xyz_path.stem
+            model_name = args.model_name.strip()
+            if model_name:
+                tile_stem = f"{model_name}_{xyz_path.stem}"
+            else:
+                tile_stem = xyz_path.stem
+            stl_path = output_tiles_dir / f"{tile_stem}.stl"
+            per_file_name = tile_stem
             try:
                 convert_one(
                     xyz_path,

@@ -80,6 +80,8 @@ class App(tk.Tk):
         self.status_vars: dict[str, tk.StringVar] = {}
         self.status_labels: dict[str, ttk.Label] = {}
         self.current_status_key: str | None = None
+        self.model_name_var = tk.StringVar(value=DEFAULTS["model_name"])
+        self._auto_merge_out = ""
 
         self._setup_theme()
         self._build_ui()
@@ -141,6 +143,18 @@ class App(tk.Tk):
             header,
             text="Download tiles, convert to STL, then merge into a print-ready model.",
         ).pack(anchor=tk.W)
+        name_row = ttk.Frame(header)
+        name_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(name_row, text="Model name:").pack(side=tk.LEFT)
+        self.model_name_entry = ttk.Entry(name_row, textvariable=self.model_name_var, width=24)
+        self.model_name_entry.pack(side=tk.LEFT, padx=(6, 0))
+        self.model_name_entry.bind("<KeyRelease>", self._on_model_name_change)
+        self.tooltips.append(
+            Tooltip(
+                self.model_name_entry,
+                "Used to name output STL files and the STL solid name.",
+            )
+        )
 
         steps = ttk.Frame(main)
         steps.pack(fill=tk.X)
@@ -360,7 +374,8 @@ class App(tk.Tk):
         frame = ttk.LabelFrame(parent, text="3) Merge tiles into final STL")
         frame.pack(fill=tk.X)
 
-        self.merge_out_var = tk.StringVar(value=str(self.output_dir / DEFAULTS["merge_out"]))
+        self._auto_merge_out = str(self.output_dir / DEFAULTS["merge_out"])
+        self.merge_out_var = tk.StringVar(value=self._auto_merge_out)
         self.weld_tol_var = tk.StringVar(value=DEFAULTS["weld_tolerance"])
         self.merge_z_scale_var = tk.StringVar(value=DEFAULTS["merge_z_scale"])
         self.make_solid_var = tk.BooleanVar(value=DEFAULTS["make_solid"])
@@ -498,6 +513,7 @@ class App(tk.Tk):
         )
         if path:
             self.merge_out_var.set(path)
+            self._auto_merge_out = path
 
     def _run_download(self) -> None:
         args = [sys.executable, "download_tiles.py"]
@@ -538,6 +554,10 @@ class App(tk.Tk):
         if z_scale:
             args += ["--z-scale", z_scale]
 
+        model_name = self.model_name_var.get().strip()
+        if model_name:
+            args += ["--model-name", model_name]
+
         self._run_command(args, "Convert tiles", status_key="convert")
 
     def _run_merge(self) -> None:
@@ -568,7 +588,20 @@ class App(tk.Tk):
             if base_z:
                 args += ["--base-z", base_z]
 
+        model_name = self.model_name_var.get().strip()
+        if model_name:
+            args += ["--model-name", model_name]
+
         self._run_command(args, "Merge tiles", status_key="merge")
+
+    def _on_model_name_change(self, _event: tk.Event) -> None:
+        name = self.model_name_var.get().strip()
+        if not name:
+            return
+        auto_path = str(self.output_dir / f"{name}.stl")
+        if self.merge_out_var.get().strip() in {"", self._auto_merge_out}:
+            self.merge_out_var.set(auto_path)
+            self._auto_merge_out = auto_path
 
     def _run_command(self, args: list[str], label: str, status_key: str) -> None:
         if self.current_process is not None:
