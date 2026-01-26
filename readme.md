@@ -1,67 +1,91 @@
-# XYZ to STL Terrain Converter
+# SwissTopo STL Converter (GUI-first)
 
-This tool converts terrain point clouds stored as .xyz files into STL surface meshes.
-It is designed for large, gridded terrain datasets and supports batch conversion and seamless merging.
+This project is built around the GUI. Use it to download SwissTopo XYZ tiles, convert them into STL tiles, and merge them into a single printable STL with optional base.
 
----
+Run the GUI:
 
-## Quick Start (recommended workflow)
-
-GUI (guided workflow):
-```
+```bash
 python gui.py
 ```
 
-1) Download XYZ tiles
-- Get terrain tiles as XYZ (X Y Z per line).
-- Put your CSV of download URLs in `./data` and run:
+---
 
-```
-python download_tiles.py
-```
+## GUI Workflow (recommended)
 
-- This downloads ZIPs into temp folders and copies all XYZ files into `./data/xyz`.
+The GUI is organized into three steps that match the full workflow:
 
-Swisstopo sources:
-- swissALTI3D (DTM): https://www.swisstopo.admin.ch/de/hoehenmodell-swissalti3d
-- swissSURFACE3D Raster (DSM): https://www.swisstopo.admin.ch/de/hoehenmodell-swisssurface3d-raster
+1) **Download XYZ tiles**
+2) **Convert XYZ to STL tiles**
+3) **Merge tiles into final STL**
 
-2) Convert each XYZ to STL (one STL per tile)
-
-```
-python build_stl.py --all --step 10
-```
-
-Or auto-scale/downsample for a desired print size (smallest edge in mm):
-
-```
-python build_stl.py --all --target-size-mm 150
-```
-
-3) Merge all STL tiles into one seamless STL
-
-```
-python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001
-```
-
-4) (Optional) Make the merged STL printable with a global base
-
-```
-python build_stl.py --merge-stl output/terrain.stl --make-solid --base-thickness 10 --weld-tol 0.001
-```
-
-The base is added at the lowest point of the merged terrain minus the extra thickness.
+You can run just one step or all three in sequence.
 
 ---
 
-## Folder Structure
+## Step 1: Download XYZ tiles
+
+This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `data/xyz`.
+
+**How to use it**
+- Click **Browse** and select your CSV with download URLs.
+- (Optional) Click **Copy to data/** to keep a copy inside the project.
+- Click **Run Download**.
+- If existing XYZ tiles are found, the GUI asks whether to delete them before downloading.
+
+**CSV expectations**
+- One URL per line (simple CSVs are fine; only the first column is used).
+- Comment lines starting with `#` are ignored.
+
+**Typical SwissTopo sources**
+- swissALTI3D (DTM)
+- swissSURFACE3D Raster (DSM)
+
+---
+
+## Step 2: Convert XYZ to STL tiles
+
+This step converts every `.xyz` file in `data/xyz` into one STL tile per file in `output/tiles`.
+
+**Options**
+
+**Detail mode**
+- **Auto (size in mm)**: You choose a target print size; the tool calculates a downsample step.
+  - **Target smallest edge (mm)**: The shorter edge of the final print.
+  - **Target XY spacing (mm)**: Desired point spacing in the final STL.
+- **Manual (step)**: You set the downsample step directly.
+  - **Downsample step**: Keep every Nth grid point in X and Y.
+
+**Grid tolerance**
+- **Grid tolerance**: Snap XY to a grid to handle tiny floating noise (example: `0.001`).
+
+**Z scale**
+- **Z scale (tile conversion)**: Multiplies elevation for exaggeration (example: `2.0`).
+
+---
+
+## Step 3: Merge tiles into final STL
+
+This step merges all tiles in `output/tiles` into a single STL and optionally adds a printable base.
+
+**Options**
+- **Output STL path**: Where the final STL should be saved.
+- **Weld tolerance**: Removes tile seams by welding nearby vertices (example: `0.001` or `0.01`).
+- **Merge Z scale**: Z scaling applied during merge only.
+- **Make solid**: Adds side walls and a flat base for printing.
+  - **Base thickness**: Base thickness below the minimum elevation.
+  - **Base Z (optional)**: Explicit base elevation (overrides thickness).
+
+---
+
+## Files and Folders
 
 ```
 project/
-  build_stl.py
+  gui.py
   download_tiles.py
+  build_stl.py
   data/
-    urls.csv
+    your_urls.csv
     xyz/
       tile_001.xyz
       tile_002.xyz
@@ -72,99 +96,31 @@ project/
     terrain.stl
 ```
 
-All batch operations read from `./data/xyz` and write to `./output`.
-
 ---
 
-## Input Format
+## CLI (optional)
 
-Each .xyz file must be plain text with one point per line:
+Everything the GUI does is available via CLI if you prefer:
 
+```bash
+python download_tiles.py --csv path/to/urls.csv
+python build_stl.py --all --target-size-mm 150
+python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001 --make-solid
 ```
-X Y Z
-793483.25 1139000.25 3602.40
-793483.75 1139000.25 3602.23
-...
-```
-
-Notes:
-- A header line like X Y Z is allowed
-- Blank lines and # comments are ignored
-- Coordinates should form a complete X/Y grid for best results
-
----
-
-## Good Command Suggestions
-
-Fast and manageable for large areas:
-
-```
-python build_stl.py --all --step 10
-python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001
-```
-
-Higher detail (bigger files):
-
-```
-python build_stl.py --all --step 4
-python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001
-```
-
-Printable with a global base:
-
-```
-python build_stl.py --merge-stl output/terrain.stl --make-solid --base-thickness 10 --weld-tol 0.001
-```
-
----
-
-## Modes and Arguments (when to use what)
-
-Batch conversion (many XYZ files):
-```
-python build_stl.py --all [options]
-```
-Arguments:
-- --all (required): convert every .xyz under ./data/xyz into ./output/tiles
-Options you can use here:
-- --step N: downsample grid by keeping every Nth point in X and Y
-- --tol T: snap X/Y values to a grid of size T for noisy coordinates
-- --z-scale S: multiply all Z values (e.g. 2 for exaggeration)
-- --target-size-mm M: auto-compute scale and step from all XYZs so the smallest edge is M mm
-- --target-resolution-mm R: target XY spacing in the final STL when using --target-size-mm
-Notes:
-- --make-solid is ignored in batch mode (global base is added after merging).
-
-Merge STL tiles:
-```
-python build_stl.py --merge-stl output/terrain.stl [options]
-```
-Arguments:
-- --merge-stl (required): output STL path for the merged file; merges all .stl under ./output/tiles
-Options you can use here:
-- --weld-tol T: weld shared vertices within tolerance to remove seams
-- --make-solid: add a global base and side walls to the merged terrain
-- --base-thickness T: set base plane to minZ - T for the merged terrain
-- --base-z Z: set an explicit base Z (overrides --base-thickness)
-- --merge-z-scale S: multiply Z by this factor for the merged STL
-
----
-
-## Merge Behavior (seamless joins)
-
-Merging always loads all STL tiles, welds shared vertices, and writes a single STL.
-This removes tiny gaps at tile borders and is required for a clean global base.
 
 ---
 
 ## Troubleshooting
 
-Grid not detected:
-- Try --tol 0.001
-- Check for missing points in the XYZ file
+**Nothing downloads**
+- Check that your CSV has valid `http://` or `https://` URLs.
 
-Very large STL:
-- Increase --step
+**Grid not detected**
+- Increase **Grid tolerance** (example: `0.001`).
+- Check for missing points in the XYZ grid.
+
+**STL too large**
+- Increase **Downsample step** (manual) or use a larger **Target XY spacing** (auto).
 
 ---
 

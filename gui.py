@@ -486,6 +486,7 @@ class App(tk.Tk):
             if not messagebox.askyesno("Overwrite CSV", f"{dest} exists. Overwrite?"):
                 return
         shutil.copy2(src_path, dest)
+        self.csv_path_var.set(str(dest))
         self._log(f"Copied CSV to {dest}")
 
     def _browse_merge_out(self) -> None:
@@ -499,7 +500,20 @@ class App(tk.Tk):
             self.merge_out_var.set(path)
 
     def _run_download(self) -> None:
-        self._run_command([sys.executable, "download_tiles.py"], "Download tiles", status_key="download")
+        args = [sys.executable, "download_tiles.py"]
+        csv_path = self.csv_path_var.get().strip()
+        if csv_path:
+            args += ["--csv", csv_path]
+
+        existing_xyz = [p for p in self.xyz_dir.iterdir() if p.is_file()]
+        if existing_xyz:
+            if messagebox.askyesno(
+                "Replace XYZ files?",
+                "Existing XYZ files found in data/xyz. Delete them before downloading?",
+            ):
+                args.append("--clean-xyz")
+
+        self._run_command(args, "Download tiles", status_key="download")
 
     def _run_convert(self) -> None:
         args = [sys.executable, "build_stl.py", "--all"]

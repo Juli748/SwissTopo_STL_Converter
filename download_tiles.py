@@ -1,3 +1,4 @@
+import argparse
 import os
 import shutil
 import sys
@@ -53,13 +54,68 @@ def clear_directory(directory):
             print(f"Failed to remove: {path.name}")
 
 
-def main():
-    repo_root = Path(__file__).resolve().parent
+def _iter_csv_paths(repo_root: Path, csv_path: str | None) -> list[Path]:
+    if csv_path:
+        selected = Path(csv_path)
+        if not selected.exists():
+            print(f"CSV not found: {selected}")
+            return []
+        return [selected]
+
     data_dir = repo_root / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
     csv_files = sorted(data_dir.glob("*.csv"))
     if not csv_files:
         print(f"No CSV files found in: {data_dir}")
+        return []
+    return csv_files
+
+
+def _maybe_clear_xyz(xyz_dir: Path, clean_xyz: bool) -> None:
+    existing_xyz_files = [p for p in xyz_dir.iterdir() if p.is_file()]
+    if not existing_xyz_files:
+        return
+
+    if clean_xyz:
+        for file_path in existing_xyz_files:
+            try:
+                file_path.unlink()
+            except OSError:
+                print(f"Failed to delete: {file_path.name}")
+        return
+
+    if not sys.stdin.isatty():
+        print("Existing XYZ files found in ./data/xyz. Keeping them (non-interactive).")
+        return
+
+    response = input("Existing files found in ./data/xyz. Delete them? [y/N]: ").strip().lower()
+    if response in {"y", "yes"}:
+        for file_path in existing_xyz_files:
+            try:
+                file_path.unlink()
+            except OSError:
+                print(f"Failed to delete: {file_path.name}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Download SwissTopo tiles from CSV URLs.")
+    parser.add_argument(
+        "--csv",
+        dest="csv_path",
+        default=None,
+        help="CSV file with download URLs (if omitted, uses all CSV files in ./data).",
+    )
+    parser.add_argument(
+        "--clean-xyz",
+        action="store_true",
+        help="Delete existing files in ./data/xyz before downloading.",
+    )
+    args = parser.parse_args()
+
+    repo_root = Path(__file__).resolve().parent
+    data_dir = repo_root / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    csv_files = _iter_csv_paths(repo_root, args.csv_path)
+    if not csv_files:
         return 1
 
     extract_dir = data_dir / "_extract_temp"
@@ -70,15 +126,7 @@ def main():
     clear_directory(zips_temp_dir)
     xyz_dir = data_dir / "xyz"
     xyz_dir.mkdir(parents=True, exist_ok=True)
-    existing_xyz_files = [p for p in xyz_dir.iterdir() if p.is_file()]
-    if existing_xyz_files:
-        response = input("Existing files found in ./data/xyz. Delete them? [y/N]: ").strip().lower()
-        if response in {"y", "yes"}:
-            for file_path in existing_xyz_files:
-                try:
-                    file_path.unlink()
-                except OSError:
-                    print(f"Failed to delete: {file_path.name}")
+    _maybe_clear_xyz(xyz_dir, args.clean_xyz)
 
     urls = []
     for csv_path in csv_files:
