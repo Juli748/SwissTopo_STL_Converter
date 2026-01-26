@@ -136,11 +136,13 @@ def main():
         print("No URLs found in CSV files.")
         return 1
 
-    for url in urls:
+    total = len(urls)
+    for idx, url in enumerate(urls, 1):
         filename = os.path.basename(urlparse(url).path)
         if not filename:
             print(f"Skip (bad URL): {url}")
             continue
+        print(f"[PROGRESS] {idx}/{total} {filename}")
         zip_path = zips_temp_dir / filename
         try:
             download_file(url, zip_path)

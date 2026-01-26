@@ -82,6 +82,8 @@ class App(tk.Tk):
         self.current_status_key: str | None = None
         self.model_name_var = tk.StringVar(value=DEFAULTS["model_name"])
         self._auto_merge_out = ""
+        self.download_progress_var = tk.DoubleVar(value=0.0)
+        self.download_progress_label_var = tk.StringVar(value="")
 
         self._setup_theme()
         self._build_ui()
@@ -212,6 +214,16 @@ class App(tk.Tk):
         self.status_labels["download"].grid(
             row=1, column=4, sticky=tk.W, padx=(8, 0)
         )
+        self.download_progress = ttk.Progressbar(
+            frame,
+            variable=self.download_progress_var,
+            maximum=100.0,
+            mode="determinate",
+            length=220,
+        )
+        self.download_progress.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.download_progress_label = ttk.Label(frame, textvariable=self.download_progress_label_var)
+        self.download_progress_label.grid(row=2, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
 
         frame.columnconfigure(1, weight=1)
 
@@ -516,6 +528,8 @@ class App(tk.Tk):
             self._auto_merge_out = path
 
     def _run_download(self) -> None:
+        self.download_progress_var.set(0.0)
+        self.download_progress_label_var.set("")
         args = [sys.executable, "download_tiles.py"]
         csv_path = self.csv_path_var.get().strip()
         if csv_path:
@@ -607,6 +621,8 @@ class App(tk.Tk):
         if self.current_process is not None:
             messagebox.showinfo("Busy", "Another task is running.")
             return
+        if args and args[0] == sys.executable and "-u" not in args:
+            args.insert(1, "-u")
         self._set_status(status_key, "Running...", "#38bdf8")
         self.current_status_key = status_key
 
@@ -644,8 +660,26 @@ class App(tk.Tk):
                 line = self.log_queue.get_nowait()
             except queue.Empty:
                 break
+            self._handle_progress_line(line)
             self._log(line)
         self.after(100, self._poll_log)
+
+    def _handle_progress_line(self, line: str) -> None:
+        if not line.startswith("[PROGRESS]"):
+            return
+        try:
+            payload = line[len("[PROGRESS]"):].strip()
+            counter, name = payload.split(" ", 1)
+            current_str, total_str = counter.split("/", 1)
+            current = int(current_str)
+            total = int(total_str)
+        except ValueError:
+            return
+        if total <= 0:
+            return
+        pct = (current / total) * 100.0
+        self.download_progress_var.set(pct)
+        self.download_progress_label_var.set(f"Downloaded {current} of {total} ({name})")
 
     def _log(self, message: str) -> None:
         self.log_text.insert(tk.END, message + "\n")
