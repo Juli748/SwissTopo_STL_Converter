@@ -91,6 +91,8 @@ class App(tk.Tk):
         self._auto_merge_out = ""
         self.download_progress_var = tk.DoubleVar(value=0.0)
         self.download_progress_label_var = tk.StringVar(value="")
+        self.convert_progress_var = tk.DoubleVar(value=0.0)
+        self.convert_progress_label_var = tk.StringVar(value="")
 
         self._setup_theme()
         self._build_ui()
@@ -349,6 +351,17 @@ class App(tk.Tk):
         self.status_labels["convert"].grid(
             row=5, column=2, sticky=tk.W, padx=(12, 0)
         )
+        self.convert_progress = ttk.Progressbar(
+            frame,
+            variable=self.convert_progress_var,
+            maximum=100.0,
+            mode="determinate",
+            length=220,
+        )
+        self.convert_progress.grid(row=6, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress_label = ttk.Label(frame, textvariable=self.convert_progress_label_var)
+        self.convert_progress_label.grid(row=6, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress_label.configure(width=26)
 
         self._update_convert_mode()
 
@@ -590,6 +603,8 @@ class App(tk.Tk):
         self._run_command(args, "Download tiles", status_key="download")
 
     def _run_convert(self) -> None:
+        self.convert_progress_var.set(0.0)
+        self.convert_progress_label_var.set("")
         args = [sys.executable, "build_stl.py", "--all"]
 
         if self.mode_var.get() == "auto":
@@ -726,8 +741,12 @@ class App(tk.Tk):
         if total <= 0:
             return
         pct = (current / total) * 100.0
-        self.download_progress_var.set(pct)
-        self.download_progress_label_var.set(f"Downloaded {current} of {total} ({name})")
+        if self.current_status_key == "download":
+            self.download_progress_var.set(pct)
+            self.download_progress_label_var.set(f"Downloaded {current} of {total} ({name})")
+        elif self.current_status_key == "convert":
+            self.convert_progress_var.set(pct)
+            self.convert_progress_label_var.set(f"Converted {current} of {total} ({name})")
 
     def _log(self, message: str) -> None:
         self.log_text.insert(tk.END, message + "\n")

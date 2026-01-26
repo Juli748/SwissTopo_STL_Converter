@@ -104,6 +104,14 @@ def _download_and_unzip(url, filename, zips_temp_dir, extract_dir):
     return filename
 
 
+def _has_xyz_for_zip(xyz_dir: Path, filename: str) -> bool:
+    stem = Path(filename).stem
+    if (xyz_dir / f"{stem}.xyz").exists():
+        return True
+    matches = list(xyz_dir.glob(f"{stem}*.xyz"))
+    return bool(matches)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Download SwissTopo tiles from CSV URLs.")
     parser.add_argument(
@@ -146,21 +154,30 @@ def main():
     for csv_path in csv_files:
         urls.extend(iter_urls_from_csv(csv_path))
 
-    tasks = []
+    items = []
     for url in urls:
         filename = os.path.basename(urlparse(url).path)
         if not filename:
             print(f"Skip (bad URL): {url}")
             continue
-        tasks.append((url, filename))
+        already = _has_xyz_for_zip(xyz_dir, filename)
+        items.append((url, filename, already))
 
-    if not tasks:
+    if not items:
         print("No URLs found in CSV files.")
         return 1
 
-    total = len(tasks)
+    total = len(items)
     workers = max(1, int(args.workers))
     completed = 0
+    tasks = []
+    for url, filename, already in items:
+        if already:
+            completed += 1
+            print(f"Skip (already downloaded): {filename}")
+            print(f"[PROGRESS] {completed}/{total} {filename}")
+            continue
+        tasks.append((url, filename))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
             executor.submit(_download_and_unzip, url, filename, zips_temp_dir, extract_dir): (url, filename)
