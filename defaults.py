@@ -4,6 +4,7 @@ DEFAULTS = {
     "model_name": "terrain",
     "csv_path": "",
     "download_workers": "4",
+    "convert_workers": "2",
     "mode": "auto",
     "target_size_mm": "100",
     "target_resolution_mm": "0.3",

@@ -336,12 +336,18 @@ class App(tk.Tk):
         auto_hint = ttk.Label(frame, text="Auto = program picks step to hit print size.")
         auto_hint.grid(row=3, column=2, columnspan=2, sticky=tk.W, padx=(12, 0))
 
+        convert_workers_label = ttk.Label(frame, text="Max parallel conversions:")
+        convert_workers_label.grid(row=4, column=0, sticky=tk.W, pady=4)
+        self.convert_workers_var = tk.StringVar(value=DEFAULTS["convert_workers"])
+        convert_workers_entry = ttk.Entry(frame, textvariable=self.convert_workers_var, width=10)
+        convert_workers_entry.grid(row=4, column=1, sticky=tk.W)
+
         self.convert_btn = ttk.Button(frame, text="Run Conversion", command=self._run_convert)
-        self.convert_btn.grid(row=4, column=3, sticky=tk.E, padx=4, pady=6)
+        self.convert_btn.grid(row=5, column=3, sticky=tk.E, padx=4, pady=6)
         self.status_vars["convert"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["convert"] = ttk.Label(frame, textvariable=self.status_vars["convert"])
         self.status_labels["convert"].grid(
-            row=4, column=2, sticky=tk.W, padx=(12, 0)
+            row=5, column=2, sticky=tk.W, padx=(12, 0)
         )
 
         self._update_convert_mode()
@@ -402,6 +408,14 @@ class App(tk.Tk):
             Tooltip(
                 auto_hint,
                 "Auto mode ignores the manual step field.",
+            ),
+            Tooltip(
+                convert_workers_label,
+                "How many tiles to convert in parallel. Higher is faster but uses more CPU/RAM.",
+            ),
+            Tooltip(
+                convert_workers_entry,
+                "Try 2-4 on a typical laptop. Set to 1 for sequential conversion.",
             ),
             Tooltip(
                 self.convert_btn,
@@ -597,6 +611,10 @@ class App(tk.Tk):
         z_scale = self.z_scale_var.get().strip()
         if z_scale:
             args += ["--z-scale", z_scale]
+
+        workers = self.convert_workers_var.get().strip()
+        if workers:
+            args += ["--workers", workers]
 
         model_name = self.model_name_var.get().strip()
         if model_name:

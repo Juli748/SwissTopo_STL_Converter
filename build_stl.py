@@ -31,6 +31,7 @@ import argparse
 import math
 import struct
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -678,6 +679,36 @@ def convert_one(
     print(f"Wrote {stl_path} with {mesh.faces.shape[0]:,} triangles and {mesh.vertices.shape[0]:,} vertices.")
 
 
+def _convert_worker(payload: Tuple[Path, Path, str, float, float, float, int, float, Optional[float], bool]) -> str:
+    (
+        xyz_path,
+        stl_path,
+        per_file_name,
+        tol,
+        z_scale,
+        scale,
+        step,
+        base_thickness_value,
+        base_z_value,
+        assume_grid,
+    ) = payload
+    convert_one(
+        xyz_path,
+        stl_path,
+        name=per_file_name,
+        tol=float(tol),
+        z_scale=float(z_scale),
+        scale=float(scale),
+        step=int(step),
+        binary=True,
+        make_solid_flag=False,
+        base_thickness_value=float(base_thickness_value),
+        base_z_value=base_z_value,
+        assume_grid=bool(assume_grid),
+    )
+    return xyz_path.name
+
+
 def _list_xyz_files() -> List[Path]:
     folder = Path("./data/xyz")
     if not folder.exists():
@@ -970,6 +1001,12 @@ def main() -> None:
         default="",
         help="Optional model name used for output naming and STL solid name.",
     )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers for --all conversion (default: 1).",
+    )
 
     args = ap.parse_args()
 
@@ -1017,32 +1054,58 @@ def main() -> None:
         output_tiles_dir = Path("./output/tiles")
         output_tiles_dir.mkdir(parents=True, exist_ok=True)
 
+        tasks: List[Tuple[Path, Path, str, float, float, float, int, float, Optional[float], bool]] = []
+        model_name = args.model_name.strip()
         for xyz_path in xyz_files:
-            model_name = args.model_name.strip()
             if model_name:
                 tile_stem = f"{model_name}_{xyz_path.stem}"
             else:
                 tile_stem = xyz_path.stem
             stl_path = output_tiles_dir / f"{tile_stem}.stl"
             per_file_name = tile_stem
-            try:
-                convert_one(
+            tasks.append(
+                (
                     xyz_path,
                     stl_path,
-                    name=per_file_name,
-                    tol=float(args.tol),
-                    z_scale=float(args.z_scale),
-                    scale=float(auto_scale),
-                    step=int(auto_step),
-                    binary=True,
-                    make_solid_flag=False,
-                    base_thickness_value=float(args.base_thickness),
-                    base_z_value=args.base_z,
-                    assume_grid=True,
+                    per_file_name,
+                    float(args.tol),
+                    float(args.z_scale),
+                    float(auto_scale),
+                    int(auto_step),
+                    float(args.base_thickness),
+                    args.base_z,
+                    True,
                 )
-            except Exception as e:
-                print(f"ERROR converting {xyz_path}: {e}")
-                continue
+            )
+
+        workers = max(1, int(args.workers))
+        if workers == 1 or len(tasks) == 1:
+            for task in tasks:
+                xyz_path = task[0]
+                try:
+                    _convert_worker(task)
+                except Exception as e:
+                    print(f"ERROR converting {xyz_path}: {e}")
+            return
+
+        total = len(tasks)
+        completed = 0
+        failures = 0
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {executor.submit(_convert_worker, task): task for task in tasks}
+            for future in as_completed(future_map):
+                task = future_map[future]
+                xyz_path = task[0]
+                completed += 1
+                try:
+                    future.result()
+                except Exception as e:
+                    failures += 1
+                    print(f"ERROR converting {xyz_path}: {e}")
+                print(f"[PROGRESS] {completed}/{total} {xyz_path.name}")
+
+        if failures:
+            print(f"[WARN] {failures} tile(s) failed during conversion.")
         return
 
     ap.error("Use --all to convert tiles or --merge-stl <out.stl> to merge.")
