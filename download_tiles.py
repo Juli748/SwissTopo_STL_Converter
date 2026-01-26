@@ -3,6 +3,7 @@ import os
 import shutil
 import sys
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen, Request
@@ -96,6 +97,13 @@ def _maybe_clear_xyz(xyz_dir: Path, clean_xyz: bool) -> None:
                 print(f"Failed to delete: {file_path.name}")
 
 
+def _download_and_unzip(url, filename, zips_temp_dir, extract_dir):
+    zip_path = zips_temp_dir / filename
+    download_file(url, zip_path)
+    unzip_file(zip_path, extract_dir)
+    return filename
+
+
 def main():
     parser = argparse.ArgumentParser(description="Download SwissTopo tiles from CSV URLs.")
     parser.add_argument(
@@ -108,6 +116,12 @@ def main():
         "--clean-xyz",
         action="store_true",
         help="Delete existing files in ./data/xyz before downloading.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel download workers (default: 4).",
     )
     args = parser.parse_args()
 
@@ -132,23 +146,34 @@ def main():
     for csv_path in csv_files:
         urls.extend(iter_urls_from_csv(csv_path))
 
-    if not urls:
-        print("No URLs found in CSV files.")
-        return 1
-
-    total = len(urls)
-    for idx, url in enumerate(urls, 1):
+    tasks = []
+    for url in urls:
         filename = os.path.basename(urlparse(url).path)
         if not filename:
             print(f"Skip (bad URL): {url}")
             continue
-        print(f"[PROGRESS] {idx}/{total} {filename}")
-        zip_path = zips_temp_dir / filename
-        try:
-            download_file(url, zip_path)
-            unzip_file(zip_path, extract_dir)
-        except Exception as exc:
-            print(f"Failed: {url} ({exc})")
+        tasks.append((url, filename))
+
+    if not tasks:
+        print("No URLs found in CSV files.")
+        return 1
+
+    total = len(tasks)
+    workers = max(1, int(args.workers))
+    completed = 0
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(_download_and_unzip, url, filename, zips_temp_dir, extract_dir): (url, filename)
+            for url, filename in tasks
+        }
+        for future in as_completed(future_map):
+            url, filename = future_map[future]
+            completed += 1
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"Failed: {url} ({exc})")
+            print(f"[PROGRESS] {completed}/{total} {filename}")
     # Best-effort cleanup of temp zip folder.
     for zip_path in zips_temp_dir.glob("*"):
         try:

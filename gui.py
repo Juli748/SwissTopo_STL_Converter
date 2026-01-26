@@ -63,6 +63,13 @@ class App(tk.Tk):
         self.title(DEFAULTS["window_title"])
         self.geometry(DEFAULTS["window_geometry"])
         self.configure(bg="#0f172a")
+        self.update_idletasks()
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        target_w = min(900, max(720, screen_w - 80))
+        target_h = min(860, max(720, screen_h - 120))
+        self.geometry(f"{target_w}x{target_h}")
+        self.minsize(target_w, target_h)
 
         self.data_dir = Path(__file__).resolve().parent / "data"
         self.xyz_dir = self.data_dir / "xyz"
@@ -206,14 +213,21 @@ class App(tk.Tk):
             frame,
             text="Download into data/xyz using download_tiles.py",
         )
-        download_note.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=2)
+        workers_label = ttk.Label(frame, text="Max parallel downloads:")
+        workers_label.grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.download_workers_var = tk.StringVar(value=DEFAULTS["download_workers"])
+        workers_entry = ttk.Entry(frame, textvariable=self.download_workers_var, width=8)
+        workers_entry.grid(row=1, column=1, sticky=tk.W)
+
+        download_note.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
         self.download_btn = ttk.Button(frame, text="Run Download", command=self._run_download)
-        self.download_btn.grid(row=1, column=3, padx=4, pady=6)
+        self.download_btn.grid(row=2, column=3, padx=4, pady=6)
         self.status_vars["download"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["download"] = ttk.Label(frame, textvariable=self.status_vars["download"])
         self.status_labels["download"].grid(
-            row=1, column=4, sticky=tk.W, padx=(8, 0)
+            row=2, column=4, sticky=tk.W, padx=(8, 0)
         )
+        self.status_labels["download"].configure(width=12)
         self.download_progress = ttk.Progressbar(
             frame,
             variable=self.download_progress_var,
@@ -221,11 +235,16 @@ class App(tk.Tk):
             mode="determinate",
             length=220,
         )
-        self.download_progress.grid(row=2, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.download_progress.grid(row=3, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.download_progress_label = ttk.Label(frame, textvariable=self.download_progress_label_var)
-        self.download_progress_label.grid(row=2, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.download_progress_label.grid(row=3, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.download_progress_label.configure(width=26)
 
-        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(0, minsize=200)
+        frame.columnconfigure(1, weight=1, minsize=220)
+        frame.columnconfigure(2, minsize=140)
+        frame.columnconfigure(3, minsize=120)
+        frame.columnconfigure(4, minsize=140)
 
         self.tooltips += [
             Tooltip(
@@ -243,6 +262,14 @@ class App(tk.Tk):
             Tooltip(
                 copy_btn,
                 "Copies the CSV into ./data so it is picked up automatically next time.",
+            ),
+            Tooltip(
+                workers_label,
+                "How many downloads to run in parallel. Higher is faster but uses more bandwidth.",
+            ),
+            Tooltip(
+                workers_entry,
+                "Try 4-8 for faster downloads. Set to 1 for sequential.",
             ),
             Tooltip(
                 self.download_btn,
@@ -534,6 +561,9 @@ class App(tk.Tk):
         csv_path = self.csv_path_var.get().strip()
         if csv_path:
             args += ["--csv", csv_path]
+        workers = self.download_workers_var.get().strip()
+        if workers:
+            args += ["--workers", workers]
 
         existing_xyz = [p for p in self.xyz_dir.iterdir() if p.is_file()]
         if existing_xyz:
