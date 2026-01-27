@@ -16,7 +16,17 @@ Source page:
 https://www.swisstopo.admin.ch/de/hoehenmodell-swissalti3d
 ```
 
-This project is built around the GUI. Use it to download SwissTopo XYZ tiles, convert them into STL tiles, and merge them into a single printable STL with optional base.
+This project is built around the GUI. Use it to download SwissTopo XYZ or GeoTIFF tiles, convert them into STL tiles, and merge them into a single printable STL with optional base.
+
+**Prefer GeoTIFF (COG): it is much smaller.**
+SwissTopo’s technical notes highlight the size difference between Cloud Optimized GeoTIFF (COG, LZW compressed) and ASCII XYZ:
+- **0.5 m COG**: ~26 MB per tile, ~770 GB full coverage
+- **2 m COG**: ~1 MB per tile, ~44 GB full coverage
+- **0.5 m ASCII XYZ**: ~120 MB per tile, ~5.2 TB full coverage
+- **2 m ASCII XYZ**: ~6 MB per tile, ~265 GB full coverage
+- Tile grid: ~43,500 tiles of 1 km x 1 km
+
+Source: SwissTopo swissALTI3D technical notes (see the SwissTopo swissALTI3D page).
 
 Run the GUI:
 
@@ -49,6 +59,11 @@ Optional (only needed if your XYZ is not a perfect grid and you need triangulati
 py -3 -m pip install scipy
 ```
 
+Optional (only needed for GeoTIFF / COG input):
+```bash
+py -3 -m pip install rasterio
+```
+
 **Optional: Use Conda instead of the system Python**
 ```bash
 conda create -n swisstopo-stl python=3.11 -y
@@ -72,17 +87,17 @@ py -3 gui.py
 
 The GUI is organized into three steps that match the full workflow:
 
-1) **Download XYZ tiles**
-2) **Convert XYZ to STL tiles**
+1) **Download XYZ/TIF tiles**
+2) **Convert XYZ/TIF to STL tiles**
 3) **Merge tiles into final STL**
 
 You can run just one step or all three in sequence.
 
 ---
 
-## Step 1: Download XYZ tiles
+## Step 1: Download XYZ/TIF tiles
 
-This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `data/xyz`.
+This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `data/xyz`. It also supports GeoTIFF/COG URLs that download directly into `data/tif`.
 
 **How to use it**
 - Click **Browse** and select your CSV with download URLs.
@@ -93,6 +108,7 @@ This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `da
 **CSV expectations**
 - One URL per line (simple CSVs are fine; only the first column is used).
 - Comment lines starting with `#` are ignored.
+- Supports ZIPs containing XYZ and direct GeoTIFF/COG URLs.
 
 **Typical SwissTopo sources**
 - swissALTI3D (DTM)
@@ -100,9 +116,9 @@ This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `da
 
 ---
 
-## Step 2: Convert XYZ to STL tiles
+## Step 2: Convert XYZ/TIF to STL tiles
 
-This step converts every `.xyz` file in `data/xyz` into one STL tile per file in `output/tiles`.
+This step converts every `.xyz` file in `data/xyz` and every `.tif/.tiff` file in `data/tif` (or `data/`) into one STL tile per file in `output/tiles`.
 
 **Options**
 
@@ -118,6 +134,9 @@ This step converts every `.xyz` file in `data/xyz` into one STL tile per file in
 
 **Z scale**
 - **Z scale (tile conversion)**: Multiplies elevation for exaggeration (example: `2.0`).
+
+**Tip**
+- Delete old tiles before a new conversion run so they do not get merged later. In the GUI you’ll be prompted, or via CLI use `--clean-tiles`.
 
 ---
 
@@ -147,10 +166,13 @@ project/
     xyz/
       tile_001.xyz
       tile_002.xyz
+    tif/
+      tile_003.tif
   output/
     tiles/
       tile_001.stl
       tile_002.stl
+      tile_003.stl
     terrain.stl
 ```
 

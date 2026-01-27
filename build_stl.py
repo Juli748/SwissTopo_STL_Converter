@@ -25,12 +25,12 @@ Global solid (important for printing):
   This avoids internal “steps” between tiles.
 """
 
-#TODO: Add support for tiff input instead of only xyz, see sample data in /data
 
 from __future__ import annotations
 
 import argparse
 import math
+import shutil
 import struct
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -100,6 +100,66 @@ def load_xyz(path: Path) -> np.ndarray:
     return arr
 
 
+def load_geotiff_grid(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load a GeoTIFF/COG into grid coordinates.
+    Returns (xs, ys, z_grid) where xs shape (nx,), ys shape (ny,), z_grid shape (ny, nx).
+    """
+    try:
+        import rasterio
+        from rasterio.transform import xy as transform_xy
+    except Exception as e:
+        raise RuntimeError(
+            "GeoTIFF input requires rasterio. Install it via: pip install rasterio"
+        ) from e
+
+    print(f"[1/4] Reading GeoTIFF: {path}")
+    with rasterio.open(path) as dataset:
+        if dataset.count < 1:
+            raise ValueError(f"{path}: no raster bands found")
+        z = dataset.read(1, masked=True)
+        transform = dataset.transform
+        height, width = z.shape
+
+        rotated = abs(transform.b) > 1e-12 or abs(transform.d) > 1e-12
+        if rotated:
+            rows = np.arange(height)
+            cols = np.arange(width)
+            xs, ys = transform_xy(transform, rows[:, None], cols[None, :], offset="center")
+            xs = np.asarray(xs, dtype=np.float64)
+            ys = np.asarray(ys, dtype=np.float64)
+        else:
+            xs = transform.c + (np.arange(width, dtype=np.float64) + 0.5) * transform.a
+            ys = transform.f + (np.arange(height, dtype=np.float64) + 0.5) * transform.e
+
+    if np.ma.is_masked(z):
+        mask = np.ma.getmaskarray(z)
+        if mask.any():
+            valid = z.compressed()
+            fill_value = float(valid.min()) if valid.size else 0.0
+            z = z.filled(fill_value)
+            print(f"[1/4]  Filled {int(mask.sum()):,} nodata pixels with {fill_value:.3f}")
+        else:
+            z = z.filled(0.0)
+    else:
+        z = np.asarray(z, dtype=np.float64)
+
+    z = np.asarray(z, dtype=np.float64)
+    if xs.ndim == 1 and ys.ndim == 1:
+        if z.shape != (len(ys), len(xs)):
+            raise ValueError(f"{path}: unexpected raster shape {z.shape} vs grid {len(ys)}x{len(xs)}")
+    else:
+        if z.shape != xs.shape or z.shape != ys.shape:
+            raise ValueError(f"{path}: unexpected raster shape {z.shape} vs XY grids {xs.shape}/{ys.shape}")
+
+    print(f"  Grid size: {len(xs):,} x {len(ys):,} = {z.size:,} samples")
+    print(f"  Bounds X: {float(xs.min()):.3f} .. {float(xs.max()):.3f}")
+    print(f"  Bounds Y: {float(ys.min()):.3f} .. {float(ys.max()):.3f}")
+    print(f"  Bounds Z: {float(z.min()):.3f} .. {float(z.max()):.3f}")
+
+    return xs, ys, z
+
+
 def _min_spacing(values: List[float]) -> Optional[float]:
     if len(values) < 2:
         return None
@@ -110,7 +170,7 @@ def _min_spacing(values: List[float]) -> Optional[float]:
     return min(diffs)
 
 
-def scan_xyz_bounds_and_resolution(
+def _scan_xyz_bounds_and_resolution(
     xyz_files: List[Path],
     *,
     round_decimals: int = 6,
@@ -171,6 +231,79 @@ def scan_xyz_bounds_and_resolution(
     return min_x, max_x, min_y, max_y, min_spacing
 
 
+def _scan_tif_bounds_and_resolution(tif_files: List[Path]) -> Tuple[float, float, float, float, float]:
+    try:
+        import rasterio
+    except Exception as e:
+        raise RuntimeError(
+            "GeoTIFF input requires rasterio. Install it via: pip install rasterio"
+        ) from e
+
+    min_x = float("inf")
+    max_x = float("-inf")
+    min_y = float("inf")
+    max_y = float("-inf")
+    min_spacing = float("inf")
+
+    for path in tif_files:
+        print(f"[AUTO] Scanning GeoTIFF: {path}")
+        with rasterio.open(path) as dataset:
+            bounds = dataset.bounds
+            min_x = min(min_x, bounds.left)
+            max_x = max(max_x, bounds.right)
+            min_y = min(min_y, bounds.bottom)
+            max_y = max(max_y, bounds.top)
+            res_x, res_y = dataset.res
+            spacing = min(abs(float(res_x)), abs(float(res_y)))
+            if spacing > 0:
+                min_spacing = min(min_spacing, spacing)
+
+    if not math.isfinite(min_x) or not math.isfinite(min_y):
+        raise ValueError("No valid GeoTIFF bounds found while scanning.")
+
+    if not math.isfinite(min_spacing):
+        raise ValueError("Could not determine XY resolution from GeoTIFF files.")
+
+    return min_x, max_x, min_y, max_y, min_spacing
+
+
+def scan_input_bounds_and_resolution(
+    input_files: List[Path],
+) -> Tuple[float, float, float, float, float]:
+    xyz_files = [p for p in input_files if p.suffix.lower() == ".xyz"]
+    tif_files = [p for p in input_files if p.suffix.lower() in {".tif", ".tiff"}]
+
+    min_x = float("inf")
+    max_x = float("-inf")
+    min_y = float("inf")
+    max_y = float("-inf")
+    min_spacing = float("inf")
+
+    if xyz_files:
+        x0, x1, y0, y1, spacing = _scan_xyz_bounds_and_resolution(xyz_files)
+        min_x = min(min_x, x0)
+        max_x = max(max_x, x1)
+        min_y = min(min_y, y0)
+        max_y = max(max_y, y1)
+        min_spacing = min(min_spacing, spacing)
+
+    if tif_files:
+        x0, x1, y0, y1, spacing = _scan_tif_bounds_and_resolution(tif_files)
+        min_x = min(min_x, x0)
+        max_x = max(max_x, x1)
+        min_y = min(min_y, y0)
+        max_y = max(max_y, y1)
+        min_spacing = min(min_spacing, spacing)
+
+    if not math.isfinite(min_x) or not math.isfinite(min_y):
+        raise ValueError("No valid points found while scanning input files.")
+
+    if not math.isfinite(min_spacing):
+        raise ValueError("Could not determine XY resolution from input files.")
+
+    return min_x, max_x, min_y, max_y, min_spacing
+
+
 def _prompt_optional_float(prompt: str) -> Optional[float]:
     while True:
         raw = input(prompt).strip()
@@ -188,13 +321,13 @@ def _prompt_optional_float(prompt: str) -> Optional[float]:
 
 
 def _auto_scale_and_step(
-    xyz_files: List[Path],
+    input_files: List[Path],
     *,
     target_size_mm: float,
     target_resolution_mm: float,
     edge_mode: str,
 ) -> Tuple[float, int]:
-    min_x, max_x, min_y, max_y, min_spacing = scan_xyz_bounds_and_resolution(xyz_files)
+    min_x, max_x, min_y, max_y, min_spacing = scan_input_bounds_and_resolution(input_files)
     span_x = max_x - min_x
     span_y = max_y - min_y
     min_edge = min(span_x, span_y)
@@ -311,6 +444,53 @@ def try_structured_grid(
         nx, ny = nx2, ny2
 
     print("  Building faces (vectorized)...")
+
+    grid = np.arange(nx * ny, dtype=np.int64).reshape(ny, nx)
+    v00 = grid[:-1, :-1].ravel()
+    v10 = grid[:-1, 1:].ravel()
+    v01 = grid[1:, :-1].ravel()
+    v11 = grid[1:, 1:].ravel()
+
+    faces_arr = np.vstack([
+        np.stack([v00, v10, v11], axis=1),
+        np.stack([v00, v11, v01], axis=1),
+    ])
+
+    total_cells = (ny - 1) * (nx - 1)
+    print(f"  Built {faces_arr.shape[0]:,} triangles from {total_cells:,} cells.")
+    return Mesh(vertices=verts, faces=faces_arr)
+
+
+def mesh_from_grid(xs: np.ndarray, ys: np.ndarray, zs: np.ndarray, *, step: int = 1) -> Mesh:
+    if step < 1:
+        raise ValueError("--step must be >= 1")
+    if xs.ndim == 1 and ys.ndim == 1:
+        if zs.shape != (len(ys), len(xs)):
+            raise ValueError("Grid dimensions do not match Z array.")
+    else:
+        if zs.shape != xs.shape or zs.shape != ys.shape:
+            raise ValueError("Grid dimensions do not match Z array.")
+
+    if step > 1:
+        if xs.ndim == 1 and ys.ndim == 1:
+            x_idx = np.unique(np.r_[np.arange(0, len(xs), step), len(xs) - 1])
+            y_idx = np.unique(np.r_[np.arange(0, len(ys), step), len(ys) - 1])
+            xs = xs[x_idx]
+            ys = ys[y_idx]
+            zs = zs[np.ix_(y_idx, x_idx)]
+        else:
+            y_idx = np.unique(np.r_[np.arange(0, zs.shape[0], step), zs.shape[0] - 1])
+            x_idx = np.unique(np.r_[np.arange(0, zs.shape[1], step), zs.shape[1] - 1])
+            xs = xs[np.ix_(y_idx, x_idx)]
+            ys = ys[np.ix_(y_idx, x_idx)]
+            zs = zs[np.ix_(y_idx, x_idx)]
+
+    ny, nx = zs.shape
+    if xs.ndim == 1 and ys.ndim == 1:
+        xv, yv = np.meshgrid(xs, ys)
+    else:
+        xv, yv = xs, ys
+    verts = np.column_stack([xv.ravel(), yv.ravel(), zs.ravel()])
 
     grid = np.arange(nx * ny, dtype=np.int64).reshape(ny, nx)
     v00 = grid[:-1, :-1].ravel()
@@ -670,19 +850,32 @@ def convert_one(
     print(f"Converting: {xyz_path.name} -> {stl_path.name}")
     print("=" * 80)
 
-    pts = load_xyz(xyz_path)
-    if scale != 1.0:
-        print(f"[1/4] Applying scale: {scale}")
-        pts = pts.copy()
-        pts *= float(scale)
-    if z_scale != 1.0:
-        print(f"[1/4] Applying Z scale: {z_scale}")
-        pts = pts.copy()
-        pts[:, 2] *= float(z_scale)
+    if xyz_path.suffix.lower() in {".tif", ".tiff"}:
+        xs, ys, zs = load_geotiff_grid(xyz_path)
+        if scale != 1.0:
+            print(f"[1/4] Applying scale: {scale}")
+            xs = xs * float(scale)
+            ys = ys * float(scale)
+            zs = zs * float(scale)
+        if z_scale != 1.0:
+            print(f"[1/4] Applying Z scale: {z_scale}")
+            zs = zs * float(z_scale)
+        print("[2/4] Building mesh from raster grid...")
+        mesh = mesh_from_grid(xs, ys, zs, step=int(step))
+    else:
+        pts = load_xyz(xyz_path)
+        if scale != 1.0:
+            print(f"[1/4] Applying scale: {scale}")
+            pts = pts.copy()
+            pts *= float(scale)
+        if z_scale != 1.0:
+            print(f"[1/4] Applying Z scale: {z_scale}")
+            pts = pts.copy()
+            pts[:, 2] *= float(z_scale)
 
-    mesh = try_structured_grid(pts, tol=float(tol), step=int(step), assume_grid=bool(assume_grid))
-    if mesh is None:
-        mesh = delaunay_triangulation(pts)
+        mesh = try_structured_grid(pts, tol=float(tol), step=int(step), assume_grid=bool(assume_grid))
+        if mesh is None:
+            mesh = delaunay_triangulation(pts)
 
     if make_solid_flag:
         if base_z_value is not None:
@@ -735,14 +928,31 @@ def _convert_worker(
     return xyz_path.name
 
 
-def _list_xyz_files() -> List[Path]:
-    folder = Path("./data/xyz")
-    if not folder.exists():
-        raise SystemExit(f"Folder not found: {folder.resolve()}")
-    xyz_files = sorted(folder.rglob("*.xyz"))
-    if not xyz_files:
-        raise SystemExit(f"No .xyz files found in: {folder.resolve()}")
-    return xyz_files
+def _list_input_files() -> List[Path]:
+    xyz_folder = Path("./data/xyz")
+    tif_folder = Path("./data/tif")
+    xyz_files = sorted(xyz_folder.rglob("*.xyz")) if xyz_folder.exists() else []
+    tif_files = []
+    if tif_folder.exists():
+        tif_files = sorted(tif_folder.rglob("*.tif")) + sorted(tif_folder.rglob("*.tiff"))
+    root_tifs = sorted(Path("./data").glob("*.tif")) + sorted(Path("./data").glob("*.tiff"))
+    input_files = []
+    for path in tif_files + root_tifs:
+        if path not in input_files:
+            input_files.append(path)
+
+    if input_files and xyz_files:
+        print(
+            "[INFO] GeoTIFF inputs found. Ignoring XYZ tiles to avoid duplicate coverage."
+        )
+        return input_files
+
+    input_files = xyz_files + input_files
+    if not input_files:
+        raise SystemExit(
+            "No .xyz or .tif files found in ./data/xyz, ./data/tif, or ./data."
+        )
+    return input_files
 
 
 def _list_stl_files() -> List[Path]:
@@ -945,11 +1155,11 @@ def merge_stls_mesh(
 # ----------------------------
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Convert XYZ terrain point cloud(s) to STL surface(s).")
+    ap = argparse.ArgumentParser(description="Convert XYZ/GeoTIFF terrain data to STL surface(s).")
     ap.add_argument(
         "--all",
         action="store_true",
-        help="Convert all .xyz files in ./data/xyz into ./output/tiles.",
+        help="Convert all .xyz (./data/xyz) and .tif/.tiff (./data/tif) into ./output/tiles.",
     )
     ap.add_argument(
         "--merge-stl",
@@ -1051,6 +1261,11 @@ def main() -> None:
         default=1,
         help="Number of parallel workers for --all conversion (default: 1).",
     )
+    ap.add_argument(
+        "--clean-tiles",
+        action="store_true",
+        help="Delete existing files in ./output/tiles before converting.",
+    )
 
     args = ap.parse_args()
 
@@ -1078,8 +1293,13 @@ def main() -> None:
             print("[WARN] --make-solid is ignored in --all mode. "
                   "Use --merge-stl --make-solid to add a global base after merging.")
 
-        xyz_files = _list_xyz_files()
-        print(f"Found {len(xyz_files)} .xyz file(s) in {Path('./data/xyz').resolve()}")
+        input_files = _list_input_files()
+        xyz_count = len([p for p in input_files if p.suffix.lower() == ".xyz"])
+        tif_count = len([p for p in input_files if p.suffix.lower() in {".tif", ".tiff"}])
+        print(
+            f"Found {len(input_files)} input file(s) "
+            f"({xyz_count} XYZ, {tif_count} TIF) under ./data/xyz, ./data/tif, or ./data"
+        )
 
         target_size_mm = args.target_size_mm
         target_edge = str(args.target_edge)
@@ -1094,27 +1314,36 @@ def main() -> None:
         auto_step = int(args.step)
         if target_size_mm is not None:
             auto_scale, auto_step = _auto_scale_and_step(
-                xyz_files,
+                input_files,
                 target_size_mm=float(target_size_mm),
                 target_resolution_mm=float(args.target_resolution_mm),
                 edge_mode=target_edge,
             )
 
         output_tiles_dir = Path("./output/tiles")
+        if args.clean_tiles and output_tiles_dir.exists():
+            for existing in output_tiles_dir.iterdir():
+                try:
+                    if existing.is_file():
+                        existing.unlink()
+                    else:
+                        shutil.rmtree(existing)
+                except OSError:
+                    print(f"[WARN] Failed to remove: {existing.name}")
         output_tiles_dir.mkdir(parents=True, exist_ok=True)
 
         tasks: List[Tuple[Path, Path, str, float, float, float, int, float, Optional[float], str, bool]] = []
         model_name = args.model_name.strip()
-        for xyz_path in xyz_files:
+        for input_path in input_files:
             if model_name:
-                tile_stem = f"{model_name}_{xyz_path.stem}"
+                tile_stem = f"{model_name}_{input_path.stem}"
             else:
-                tile_stem = xyz_path.stem
+                tile_stem = input_path.stem
             stl_path = output_tiles_dir / f"{tile_stem}.stl"
             per_file_name = tile_stem
             tasks.append(
                 (
-                    xyz_path,
+                    input_path,
                     stl_path,
                     per_file_name,
                     float(args.tol),
@@ -1131,11 +1360,11 @@ def main() -> None:
         workers = max(1, int(args.workers))
         if workers == 1 or len(tasks) == 1:
             for task in tasks:
-                xyz_path = task[0]
+                input_path = task[0]
                 try:
                     _convert_worker(task)
                 except Exception as e:
-                    print(f"ERROR converting {xyz_path}: {e}")
+                    print(f"ERROR converting {input_path}: {e}")
             return
 
         total = len(tasks)
@@ -1145,14 +1374,14 @@ def main() -> None:
             future_map = {executor.submit(_convert_worker, task): task for task in tasks}
             for future in as_completed(future_map):
                 task = future_map[future]
-                xyz_path = task[0]
+                input_path = task[0]
                 completed += 1
                 try:
                     future.result()
                 except Exception as e:
                     failures += 1
-                    print(f"ERROR converting {xyz_path}: {e}")
-                print(f"[PROGRESS] {completed}/{total} {xyz_path.name}")
+                    print(f"ERROR converting {input_path}: {e}")
+                print(f"[PROGRESS] {completed}/{total} {input_path.name}")
 
         if failures:
             print(f"[WARN] {failures} tile(s) failed during conversion.")

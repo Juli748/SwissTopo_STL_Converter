@@ -71,13 +71,14 @@ def _iter_csv_paths(repo_root: Path, csv_path: str | None) -> list[Path]:
     return csv_files
 
 
-def _maybe_clear_xyz(xyz_dir: Path, clean_xyz: bool) -> None:
+def _maybe_clear_inputs(xyz_dir: Path, tif_dir: Path, clean_xyz: bool) -> None:
     existing_xyz_files = [p for p in xyz_dir.iterdir() if p.is_file()]
-    if not existing_xyz_files:
+    existing_tif_files = [p for p in tif_dir.iterdir() if p.is_file()]
+    if not existing_xyz_files and not existing_tif_files:
         return
 
     if clean_xyz:
-        for file_path in existing_xyz_files:
+        for file_path in existing_xyz_files + existing_tif_files:
             try:
                 file_path.unlink()
             except OSError:
@@ -85,12 +86,12 @@ def _maybe_clear_xyz(xyz_dir: Path, clean_xyz: bool) -> None:
         return
 
     if not sys.stdin.isatty():
-        print("Existing XYZ files found in ./data/xyz. Keeping them (non-interactive).")
+        print("Existing XYZ/TIF files found in ./data. Keeping them (non-interactive).")
         return
 
-    response = input("Existing files found in ./data/xyz. Delete them? [y/N]: ").strip().lower()
+    response = input("Existing files found in ./data/xyz or ./data/tif. Delete them? [y/N]: ").strip().lower()
     if response in {"y", "yes"}:
-        for file_path in existing_xyz_files:
+        for file_path in existing_xyz_files + existing_tif_files:
             try:
                 file_path.unlink()
             except OSError:
@@ -100,7 +101,9 @@ def _maybe_clear_xyz(xyz_dir: Path, clean_xyz: bool) -> None:
 def _download_and_unzip(url, filename, zips_temp_dir, extract_dir):
     zip_path = zips_temp_dir / filename
     download_file(url, zip_path)
-    unzip_file(zip_path, extract_dir)
+    target_dir = extract_dir / Path(filename).stem
+    target_dir.mkdir(parents=True, exist_ok=True)
+    unzip_file(zip_path, target_dir)
     return filename
 
 
@@ -112,8 +115,22 @@ def _has_xyz_for_zip(xyz_dir: Path, filename: str) -> bool:
     return bool(matches)
 
 
+def _classify_url(url: str) -> tuple[str, str]:
+    filename = os.path.basename(urlparse(url).path)
+    if not filename:
+        return "unknown", filename
+    lower = filename.lower()
+    if lower.endswith(".zip"):
+        return "zip", filename
+    if lower.endswith(".tif") or lower.endswith(".tiff"):
+        return "tif", filename
+    if lower.endswith(".xyz"):
+        return "xyz", filename
+    return "unknown", filename
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Download SwissTopo tiles from CSV URLs.")
+    parser = argparse.ArgumentParser(description="Download SwissTopo XYZ or GeoTIFF tiles from CSV URLs.")
     parser.add_argument(
         "--csv",
         dest="csv_path",
@@ -123,7 +140,7 @@ def main():
     parser.add_argument(
         "--clean-xyz",
         action="store_true",
-        help="Delete existing files in ./data/xyz before downloading.",
+        help="Delete existing files in ./data/xyz and ./data/tif before downloading.",
     )
     parser.add_argument(
         "--workers",
@@ -148,7 +165,9 @@ def main():
     clear_directory(zips_temp_dir)
     xyz_dir = data_dir / "xyz"
     xyz_dir.mkdir(parents=True, exist_ok=True)
-    _maybe_clear_xyz(xyz_dir, args.clean_xyz)
+    tif_dir = data_dir / "tif"
+    tif_dir.mkdir(parents=True, exist_ok=True)
+    _maybe_clear_inputs(xyz_dir, tif_dir, args.clean_xyz)
 
     urls = []
     for csv_path in csv_files:
@@ -156,12 +175,21 @@ def main():
 
     items = []
     for url in urls:
-        filename = os.path.basename(urlparse(url).path)
+        kind, filename = _classify_url(url)
         if not filename:
             print(f"Skip (bad URL): {url}")
             continue
-        already = _has_xyz_for_zip(xyz_dir, filename)
-        items.append((url, filename, already))
+        already = False
+        if kind == "zip":
+            already = _has_xyz_for_zip(xyz_dir, filename)
+        elif kind == "tif":
+            already = (tif_dir / filename).exists()
+        elif kind == "xyz":
+            already = (xyz_dir / filename).exists()
+        else:
+            print(f"Skip (unsupported URL): {url}")
+            continue
+        items.append((url, filename, kind, already))
 
     if not items:
         print("No URLs found in CSV files.")
@@ -171,18 +199,24 @@ def main():
     workers = max(1, int(args.workers))
     completed = 0
     tasks = []
-    for url, filename, already in items:
+    for url, filename, kind, already in items:
         if already:
             completed += 1
             print(f"Skip (already downloaded): {filename}")
             print(f"[PROGRESS] {completed}/{total} {filename}")
             continue
-        tasks.append((url, filename))
+        tasks.append((url, filename, kind))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
             executor.submit(_download_and_unzip, url, filename, zips_temp_dir, extract_dir): (url, filename)
-            for url, filename in tasks
+            for url, filename, kind in tasks
+            if kind == "zip"
         }
+        for url, filename, kind in tasks:
+            if kind == "tif":
+                future_map[executor.submit(download_file, url, tif_dir / filename)] = (url, filename)
+            elif kind == "xyz":
+                future_map[executor.submit(download_file, url, xyz_dir / filename)] = (url, filename)
         for future in as_completed(future_map):
             url, filename = future_map[future]
             completed += 1
@@ -207,7 +241,8 @@ def main():
         if file_path.is_file():
             shutil.copy2(file_path, xyz_dir / file_path.name)
             copied += 1
-    print(f"Copied {copied} XYZ files to {xyz_dir}")
+    if copied:
+        print(f"Copied {copied} XYZ files to {xyz_dir}")
 
     print("Done.")
     return 0

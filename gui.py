@@ -198,7 +198,7 @@ class App(tk.Tk):
         ttk.Button(buttons, text="Open Output Folder", command=self._open_output_folder).pack(side=tk.RIGHT)
 
     def _build_step_download(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="1) Download XYZ tiles")
+        frame = ttk.LabelFrame(parent, text="1) Download XYZ/TIF tiles")
         frame.pack(fill=tk.X)
 
         csv_label = ttk.Label(frame, text="CSV with download URLs:")
@@ -213,7 +213,7 @@ class App(tk.Tk):
 
         download_note = ttk.Label(
             frame,
-            text="Download into data/xyz using download_tiles.py",
+            text="Download into data/xyz and data/tif using download_tiles.py",
         )
         workers_label = ttk.Label(frame, text="Max parallel downloads:")
         workers_label.grid(row=1, column=0, sticky=tk.W, pady=2)
@@ -275,16 +275,16 @@ class App(tk.Tk):
             ),
             Tooltip(
                 self.download_btn,
-                "Runs download_tiles.py to fetch tiles into ./data/xyz.",
+                "Runs download_tiles.py to fetch tiles into ./data/xyz and ./data/tif.",
             ),
             Tooltip(
                 download_note,
-                "Tiles are stored under ./data/xyz as .xyz files (X Y Z per line).",
+                "Tiles are stored under ./data/xyz as .xyz files and ./data/tif as GeoTIFF.",
             ),
         ]
 
     def _build_step_convert(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="2) Convert XYZ to STL tiles")
+        frame = ttk.LabelFrame(parent, text="2) Convert XYZ/TIF to STL tiles")
         frame.pack(fill=tk.X)
 
         self.mode_var = tk.StringVar(value=DEFAULTS["mode"])
@@ -644,11 +644,14 @@ class App(tk.Tk):
         if workers:
             args += ["--workers", workers]
 
+        tif_dir = self.data_dir / "tif"
+        tif_dir.mkdir(parents=True, exist_ok=True)
         existing_xyz = [p for p in self.xyz_dir.iterdir() if p.is_file()]
-        if existing_xyz:
+        existing_tif = [p for p in tif_dir.iterdir() if p.is_file()]
+        if existing_xyz or existing_tif:
             if messagebox.askyesno(
-                "Replace XYZ files?",
-                "Existing XYZ files found in data/xyz. Delete them before downloading?",
+                "Replace existing files?",
+                "Existing XYZ or TIF files found in data/xyz or data/tif. Delete them before downloading?",
             ):
                 args.append("--clean-xyz")
 
@@ -658,6 +661,16 @@ class App(tk.Tk):
         self.convert_progress_var.set(0.0)
         self.convert_progress_label_var.set("")
         args = [sys.executable, "build_stl.py", "--all"]
+
+        existing_tiles = []
+        if self.tiles_dir.exists():
+            existing_tiles = [p for p in self.tiles_dir.iterdir() if p.is_file()]
+        if existing_tiles:
+            if messagebox.askyesno(
+                "Replace STL tiles?",
+                "Existing STL tiles found in output/tiles. Delete them before converting?",
+            ):
+                args.append("--clean-tiles")
 
         if self.mode_var.get() == "auto":
             target_size = self.target_size_var.get().strip()

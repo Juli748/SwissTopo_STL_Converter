@@ -1,6 +1,6 @@
 DEFAULTS = {
     "window_title": "SwissTopo STL Converter",
-    "window_geometry": "900x700",
+    "window_geometry": "1200x1000",
     "model_name": "terrain",
     "csv_path": "",
     "download_workers": "10",
