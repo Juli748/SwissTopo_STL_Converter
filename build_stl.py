@@ -25,6 +25,8 @@ Global solid (important for printing):
   This avoids internal “steps” between tiles.
 """
 
+#TODO: Add support for tiff input instead of only xyz, see sample data in /data
+
 from __future__ import annotations
 
 import argparse
@@ -190,15 +192,22 @@ def _auto_scale_and_step(
     *,
     target_size_mm: float,
     target_resolution_mm: float,
+    edge_mode: str,
 ) -> Tuple[float, int]:
     min_x, max_x, min_y, max_y, min_spacing = scan_xyz_bounds_and_resolution(xyz_files)
     span_x = max_x - min_x
     span_y = max_y - min_y
     min_edge = min(span_x, span_y)
-    if min_edge <= 0:
+    max_edge = max(span_x, span_y)
+    if min_edge <= 0 or max_edge <= 0:
         raise ValueError("Combined XY bounds have zero size.")
 
-    scale = float(target_size_mm) / float(min_edge)
+    edge_mode = edge_mode.lower()
+    if edge_mode not in {"shortest", "longest"}:
+        raise ValueError("edge_mode must be 'shortest' or 'longest'.")
+
+    chosen_edge = min_edge if edge_mode == "shortest" else max_edge
+    scale = float(target_size_mm) / float(chosen_edge)
     spacing_mm = min_spacing * scale
     if spacing_mm <= 0:
         raise ValueError("Computed spacing is not positive; check XYZ resolution.")
@@ -211,12 +220,22 @@ def _auto_scale_and_step(
     print(f"[AUTO] Combined X span: {span_x:.3f}")
     print(f"[AUTO] Combined Y span: {span_y:.3f}")
     print(f"[AUTO] Min XY spacing: {min_spacing:.6f}")
-    print(f"[AUTO] Target min edge: {target_size_mm:.2f} mm")
+    print(f"[AUTO] Target {edge_mode} edge: {target_size_mm:.2f} mm")
     print(f"[AUTO] Scale factor: {scale:.6f} (input units -> mm)")
     print(f"[AUTO] Target XY spacing: {target_resolution_mm:.2f} mm")
     print(f"[AUTO] Output XY spacing: {spacing_mm:.3f} mm -> step={step}")
 
     return scale, step
+
+
+def _prompt_edge_mode() -> str:
+    while True:
+        raw = input("Which edge should match the target size? [shortest/longest]: ").strip().lower()
+        if raw in {"shortest", "s"}:
+            return "shortest"
+        if raw in {"longest", "l"}:
+            return "longest"
+        print("Please enter 'shortest' or 'longest'.")
 
 
 def _grid_prepare(points: np.ndarray, tol: float = 0.0) -> Optional[Tuple[np.ndarray, int, int]]:
@@ -644,6 +663,7 @@ def convert_one(
     make_solid_flag: bool,
     base_thickness_value: float,
     base_z_value: Optional[float],
+    base_mode: str,
     assume_grid: bool,
 ) -> None:
     print("\n" + "=" * 80)
@@ -665,10 +685,12 @@ def convert_one(
         mesh = delaunay_triangulation(pts)
 
     if make_solid_flag:
-        if base_z_value is None:
-            base_z = float(mesh.vertices[:, 2].min() - float(base_thickness_value))
-        else:
+        if base_z_value is not None:
             base_z = float(base_z_value)
+        elif base_mode == "sealevel":
+            base_z = 0.0
+        else:
+            base_z = float(mesh.vertices[:, 2].min() - float(base_thickness_value))
         mesh = make_solid(mesh, base_z)
 
     if binary:
@@ -679,7 +701,9 @@ def convert_one(
     print(f"Wrote {stl_path} with {mesh.faces.shape[0]:,} triangles and {mesh.vertices.shape[0]:,} vertices.")
 
 
-def _convert_worker(payload: Tuple[Path, Path, str, float, float, float, int, float, Optional[float], bool]) -> str:
+def _convert_worker(
+    payload: Tuple[Path, Path, str, float, float, float, int, float, Optional[float], str, bool]
+) -> str:
     (
         xyz_path,
         stl_path,
@@ -690,6 +714,7 @@ def _convert_worker(payload: Tuple[Path, Path, str, float, float, float, int, fl
         step,
         base_thickness_value,
         base_z_value,
+        base_mode,
         assume_grid,
     ) = payload
     convert_one(
@@ -704,6 +729,7 @@ def _convert_worker(payload: Tuple[Path, Path, str, float, float, float, int, fl
         make_solid_flag=False,
         base_thickness_value=float(base_thickness_value),
         base_z_value=base_z_value,
+        base_mode=str(base_mode),
         assume_grid=bool(assume_grid),
     )
     return xyz_path.name
@@ -871,6 +897,7 @@ def merge_stls_mesh(
     make_solid_flag: bool,
     base_thickness_value: float,
     base_z_value: Optional[float],
+    base_mode: str,
     z_scale: float,
 ) -> None:
     """
@@ -897,10 +924,12 @@ def merge_stls_mesh(
         merged = scale_mesh_z(merged, float(z_scale))
 
     if make_solid_flag:
-        if base_z_value is None:
-            base_z = float(merged.vertices[:, 2].min() - float(base_thickness_value))
-        else:
+        if base_z_value is not None:
             base_z = float(base_z_value)
+        elif base_mode == "sealevel":
+            base_z = 0.0
+        else:
+            base_z = float(merged.vertices[:, 2].min() - float(base_thickness_value))
         merged = make_solid(merged, base_z)
 
     if binary_out:
@@ -959,8 +988,15 @@ def main() -> None:
         "--target-size-mm",
         type=float,
         default=None,
-        help="Target size of the smallest XY edge in mm. "
+        help="Target size of the chosen XY edge in mm. "
              "When set in --all mode, auto-compute scale and step from XYZ bounds/resolution.",
+    )
+    ap.add_argument(
+        "--target-edge",
+        type=str,
+        default="shortest",
+        choices=["shortest", "longest"],
+        help="Which XY edge should match --target-size-mm (default: shortest).",
     )
     ap.add_argument(
         "--target-resolution-mm",
@@ -979,13 +1015,21 @@ def main() -> None:
         type=float,
         default=5.0,
         help="If --make-solid is set and --base-z is not given, base_z = min_z - base_thickness "
-             "(default: 5.0). This is the extra base below the lowest point.",
+             "when --base-mode=fixed (default: 5.0).",
     )
     ap.add_argument(
         "--base-z",
         type=float,
         default=None,
         help="Explicit Z value for the bottom plane when using --make-solid (overrides --base-thickness).",
+    )
+    ap.add_argument(
+        "--base-mode",
+        type=str,
+        default="fixed",
+        choices=["fixed", "sealevel"],
+        help="Base depth mode for --make-solid when --base-z is not set. "
+             "'fixed' uses --base-thickness; 'sealevel' uses Z=0.",
     )
 
     ap.add_argument(
@@ -1024,6 +1068,7 @@ def main() -> None:
             make_solid_flag=bool(args.make_solid),
             base_thickness_value=float(args.base_thickness),
             base_z_value=args.base_z,
+            base_mode=str(args.base_mode),
             z_scale=float(args.merge_z_scale),
         )
         return
@@ -1037,9 +1082,12 @@ def main() -> None:
         print(f"Found {len(xyz_files)} .xyz file(s) in {Path('./data/xyz').resolve()}")
 
         target_size_mm = args.target_size_mm
+        target_edge = str(args.target_edge)
         if target_size_mm is None and args.step == 1 and sys.stdin.isatty():
+            target_edge = _prompt_edge_mode()
+            edge_label = "shortest" if target_edge == "shortest" else "longest"
             target_size_mm = _prompt_optional_float(
-                "Target smallest edge length in mm (blank to keep --step 1): "
+                f"Target {edge_label} edge length in mm (blank to keep --step 1): "
             )
 
         auto_scale = 1.0
@@ -1049,12 +1097,13 @@ def main() -> None:
                 xyz_files,
                 target_size_mm=float(target_size_mm),
                 target_resolution_mm=float(args.target_resolution_mm),
+                edge_mode=target_edge,
             )
 
         output_tiles_dir = Path("./output/tiles")
         output_tiles_dir.mkdir(parents=True, exist_ok=True)
 
-        tasks: List[Tuple[Path, Path, str, float, float, float, int, float, Optional[float], bool]] = []
+        tasks: List[Tuple[Path, Path, str, float, float, float, int, float, Optional[float], str, bool]] = []
         model_name = args.model_name.strip()
         for xyz_path in xyz_files:
             if model_name:
@@ -1074,6 +1123,7 @@ def main() -> None:
                     int(auto_step),
                     float(args.base_thickness),
                     args.base_z,
+                    str(args.base_mode),
                     True,
                 )
             )

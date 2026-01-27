@@ -8,6 +8,7 @@ DEFAULTS = {
     "mode": "auto",
     "target_size_mm": "100",
     "target_resolution_mm": "0.3",
+    "target_edge": "longest",
     "step": "1",
     "grid_tolerance": "0.0",
     "z_scale": "1.0",
@@ -17,5 +18,6 @@ DEFAULTS = {
     "make_solid": True,
     "base_thickness": "5.0",
     "base_z": "",
+    "base_mode": "fixed",
     "status_idle": "",
 }

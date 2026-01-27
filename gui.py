@@ -290,6 +290,7 @@ class App(tk.Tk):
         self.mode_var = tk.StringVar(value=DEFAULTS["mode"])
         self.target_size_var = tk.StringVar(value=DEFAULTS["target_size_mm"])
         self.target_res_var = tk.StringVar(value=DEFAULTS["target_resolution_mm"])
+        self.target_edge_var = tk.StringVar(value=DEFAULTS["target_edge"])
         self.step_var = tk.StringVar(value=DEFAULTS["step"])
         self.tol_var = tk.StringVar(value=DEFAULTS["grid_tolerance"])
         self.z_scale_var = tk.StringVar(value=DEFAULTS["z_scale"])
@@ -313,43 +314,57 @@ class App(tk.Tk):
         )
         manual_radio.grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
 
-        self.target_size_label = ttk.Label(frame, text="Target smallest edge (mm):")
+        self.target_size_label = ttk.Label(frame, text="Target edge length (mm):")
         self.target_size_label.grid(row=1, column=0, sticky=tk.W, pady=4)
         self.target_size_entry = ttk.Entry(frame, textvariable=self.target_size_var, width=10)
         self.target_size_entry.grid(row=1, column=1, sticky=tk.W)
+
+        self.target_edge_label = ttk.Label(frame, text="Edge to fit:")
+        self.target_edge_label.grid(row=1, column=2, sticky=tk.W, padx=(12, 0))
+        self.target_edge_combo = ttk.Combobox(
+            frame,
+            textvariable=self.target_edge_var,
+            values=["shortest", "longest"],
+            state="readonly",
+            width=10,
+        )
+        self.target_edge_combo.grid(row=1, column=3, sticky=tk.W)
+
         self.target_res_label = ttk.Label(frame, text="Target XY spacing (mm):")
-        self.target_res_label.grid(row=1, column=2, sticky=tk.W, padx=(12, 0))
+        self.target_res_label.grid(row=2, column=0, sticky=tk.W, pady=4)
         self.target_res_entry = ttk.Entry(frame, textvariable=self.target_res_var, width=10)
-        self.target_res_entry.grid(row=1, column=3, sticky=tk.W)
+        self.target_res_entry.grid(row=2, column=1, sticky=tk.W)
 
         self.step_label = ttk.Label(frame, text="Downsample step:")
-        self.step_label.grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.step_label.grid(row=2, column=2, sticky=tk.W, padx=(12, 0))
         self.step_entry = ttk.Entry(frame, textvariable=self.step_var, width=10)
-        self.step_entry.grid(row=2, column=1, sticky=tk.W)
-        tol_label = ttk.Label(frame, text="Grid tolerance:")
-        tol_label.grid(row=2, column=2, sticky=tk.W, padx=(12, 0))
-        tol_entry = ttk.Entry(frame, textvariable=self.tol_var, width=10)
-        tol_entry.grid(row=2, column=3, sticky=tk.W)
+        self.step_entry.grid(row=2, column=3, sticky=tk.W)
 
-        z_scale_label = ttk.Label(frame, text="Z scale (tile conversion):")
-        z_scale_label.grid(row=3, column=0, sticky=tk.W, pady=4)
+        self.tol_label = ttk.Label(frame, text="Grid tolerance:")
+        self.tol_label.grid(row=3, column=0, sticky=tk.W, pady=4)
+        tol_entry = ttk.Entry(frame, textvariable=self.tol_var, width=10)
+        tol_entry.grid(row=3, column=1, sticky=tk.W)
+
+        self.z_scale_label = ttk.Label(frame, text="Z scale (tile conversion):")
+        self.z_scale_label.grid(row=3, column=2, sticky=tk.W, padx=(12, 0))
         z_scale_entry = ttk.Entry(frame, textvariable=self.z_scale_var, width=10)
-        z_scale_entry.grid(row=3, column=1, sticky=tk.W)
+        z_scale_entry.grid(row=3, column=3, sticky=tk.W)
+
         auto_hint = ttk.Label(frame, text="Auto = program picks step to hit print size.")
-        auto_hint.grid(row=3, column=2, columnspan=2, sticky=tk.W, padx=(12, 0))
+        auto_hint.grid(row=4, column=0, columnspan=3, sticky=tk.W)
 
         convert_workers_label = ttk.Label(frame, text="Max parallel conversions:")
-        convert_workers_label.grid(row=4, column=0, sticky=tk.W, pady=4)
+        convert_workers_label.grid(row=5, column=0, sticky=tk.W, pady=4)
         self.convert_workers_var = tk.StringVar(value=DEFAULTS["convert_workers"])
         convert_workers_entry = ttk.Entry(frame, textvariable=self.convert_workers_var, width=10)
-        convert_workers_entry.grid(row=4, column=1, sticky=tk.W)
+        convert_workers_entry.grid(row=5, column=1, sticky=tk.W)
 
         self.convert_btn = ttk.Button(frame, text="Run Conversion", command=self._run_convert)
-        self.convert_btn.grid(row=5, column=3, sticky=tk.E, padx=4, pady=6)
+        self.convert_btn.grid(row=6, column=3, sticky=tk.E, padx=4, pady=6)
         self.status_vars["convert"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["convert"] = ttk.Label(frame, textvariable=self.status_vars["convert"])
         self.status_labels["convert"].grid(
-            row=5, column=2, sticky=tk.W, padx=(12, 0)
+            row=6, column=2, sticky=tk.W, padx=(12, 0)
         )
         self.convert_progress = ttk.Progressbar(
             frame,
@@ -358,9 +373,9 @@ class App(tk.Tk):
             mode="determinate",
             length=220,
         )
-        self.convert_progress.grid(row=6, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress.grid(row=7, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.convert_progress_label = ttk.Label(frame, textvariable=self.convert_progress_label_var)
-        self.convert_progress_label.grid(row=6, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress_label.grid(row=7, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.convert_progress_label.configure(width=26)
 
         self._update_convert_mode()
@@ -380,11 +395,19 @@ class App(tk.Tk):
             ),
             Tooltip(
                 self.target_size_label,
-                "Smallest edge of the final print in mm. Used with Auto mode (--target-size-mm).",
+                "Chosen edge of the final print in mm. Used with Auto mode (--target-size-mm).",
             ),
             Tooltip(
                 self.target_size_entry,
-                "Example: 150 means the smallest edge of the merged model is ~150 mm.",
+                "Example: 150 means the chosen edge of the merged model is ~150 mm.",
+            ),
+            Tooltip(
+                self.target_edge_label,
+                "Select which XY edge to match the target size (--target-edge).",
+            ),
+            Tooltip(
+                self.target_edge_combo,
+                "Shortest is typical; longest helps ensure the model fits your print bed.",
             ),
             Tooltip(
                 self.target_res_label,
@@ -403,7 +426,7 @@ class App(tk.Tk):
                 "Example: 10 keeps every 10th point.",
             ),
             Tooltip(
-                tol_label,
+                self.tol_label,
                 "Snap X/Y to a grid to fix tiny coordinate noise (--tol). Use for messy data.",
             ),
             Tooltip(
@@ -411,7 +434,7 @@ class App(tk.Tk):
                 "Example: 0.001 snaps to 1 mm in map units if units are meters.",
             ),
             Tooltip(
-                z_scale_label,
+                self.z_scale_label,
                 "Multiply elevations by this factor during tile conversion (--z-scale).",
             ),
             Tooltip(
@@ -445,6 +468,7 @@ class App(tk.Tk):
         self.weld_tol_var = tk.StringVar(value=DEFAULTS["weld_tolerance"])
         self.merge_z_scale_var = tk.StringVar(value=DEFAULTS["merge_z_scale"])
         self.make_solid_var = tk.BooleanVar(value=DEFAULTS["make_solid"])
+        self.base_mode_var = tk.StringVar(value=DEFAULTS["base_mode"])
         self.base_thickness_var = tk.StringVar(value=DEFAULTS["base_thickness"])
         self.base_z_var = tk.StringVar(value=DEFAULTS["base_z"])
 
@@ -464,23 +488,41 @@ class App(tk.Tk):
         merge_z_entry = ttk.Entry(frame, textvariable=self.merge_z_scale_var, width=10)
         merge_z_entry.grid(row=1, column=3, sticky=tk.W)
 
-        make_solid_chk = ttk.Checkbutton(frame, text="Make solid", variable=self.make_solid_var)
+        make_solid_chk = ttk.Checkbutton(
+            frame,
+            text="Make solid",
+            variable=self.make_solid_var,
+            command=self._update_merge_controls,
+        )
         make_solid_chk.grid(row=2, column=0, sticky=tk.W)
-        base_thickness_label = ttk.Label(frame, text="Base thickness:")
-        base_thickness_label.grid(row=2, column=1, sticky=tk.W, pady=2)
-        base_thickness_entry = ttk.Entry(frame, textvariable=self.base_thickness_var, width=10)
-        base_thickness_entry.grid(row=2, column=2, sticky=tk.W)
-        base_z_label = ttk.Label(frame, text="Base Z (optional):")
-        base_z_label.grid(row=2, column=3, sticky=tk.W, pady=2)
-        base_z_entry = ttk.Entry(frame, textvariable=self.base_z_var, width=10)
-        base_z_entry.grid(row=2, column=4, sticky=tk.W)
+        self.base_mode_label = ttk.Label(frame, text="Base mode:")
+        self.base_mode_label.grid(row=2, column=1, sticky=tk.W, pady=2)
+        self.base_mode_combo = ttk.Combobox(
+            frame,
+            textvariable=self.base_mode_var,
+            values=["fixed", "sealevel"],
+            state="readonly",
+            width=10,
+        )
+        self.base_mode_combo.grid(row=2, column=2, sticky=tk.W)
+        self.base_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_merge_controls())
+
+        self.base_thickness_label = ttk.Label(frame, text="Base thickness:")
+        self.base_thickness_label.grid(row=2, column=3, sticky=tk.W, pady=2)
+        self.base_thickness_entry = ttk.Entry(frame, textvariable=self.base_thickness_var, width=10)
+        self.base_thickness_entry.grid(row=2, column=4, sticky=tk.W)
+
+        self.base_z_label = ttk.Label(frame, text="Base Z (optional):")
+        self.base_z_label.grid(row=3, column=0, sticky=tk.W, pady=2)
+        self.base_z_entry = ttk.Entry(frame, textvariable=self.base_z_var, width=10)
+        self.base_z_entry.grid(row=3, column=1, sticky=tk.W)
 
         self.merge_btn = ttk.Button(frame, text="Run Merge", command=self._run_merge)
-        self.merge_btn.grid(row=3, column=4, sticky=tk.E, padx=4, pady=6)
+        self.merge_btn.grid(row=4, column=4, sticky=tk.E, padx=4, pady=6)
         self.status_vars["merge"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["merge"] = ttk.Label(frame, textvariable=self.status_vars["merge"])
         self.status_labels["merge"].grid(
-            row=3, column=3, sticky=tk.W, padx=(12, 0)
+            row=4, column=3, sticky=tk.W, padx=(12, 0)
         )
 
         frame.columnconfigure(1, weight=1)
@@ -519,19 +561,27 @@ class App(tk.Tk):
                 "Adds side walls and a flat base to make the model printable (--make-solid).",
             ),
             Tooltip(
-                base_thickness_label,
+                self.base_mode_label,
+                "Fixed uses base thickness below min terrain. Sealevel uses Z=0 for alignment.",
+            ),
+            Tooltip(
+                self.base_mode_combo,
+                "Sealevel helps align multiple prints; fixed adds a base below the terrain.",
+            ),
+            Tooltip(
+                self.base_thickness_label,
                 "Distance below the minimum terrain to place the base (--base-thickness).",
             ),
             Tooltip(
-                base_thickness_entry,
-                "Used only when Make solid is enabled.",
+                self.base_thickness_entry,
+                "Used only when Make solid is enabled and Base mode is fixed.",
             ),
             Tooltip(
-                base_z_label,
+                self.base_z_label,
                 "Explicit base plane elevation (--base-z). Overrides base thickness.",
             ),
             Tooltip(
-                base_z_entry,
+                self.base_z_entry,
                 "Leave blank to use base thickness instead.",
             ),
             Tooltip(
@@ -539,6 +589,8 @@ class App(tk.Tk):
                 "Runs build_stl.py --merge-stl with the selected options.",
             ),
         ]
+
+        self._update_merge_controls()
 
     def _browse_csv(self) -> None:
         path = filedialog.askopenfilename(
@@ -611,6 +663,9 @@ class App(tk.Tk):
             target_size = self.target_size_var.get().strip()
             if target_size:
                 args += ["--target-size-mm", target_size]
+                target_edge = self.target_edge_var.get().strip()
+                if target_edge:
+                    args += ["--target-edge", target_edge]
             target_res = self.target_res_var.get().strip()
             if target_res:
                 args += ["--target-resolution-mm", target_res]
@@ -658,6 +713,9 @@ class App(tk.Tk):
 
         if self.make_solid_var.get():
             args.append("--make-solid")
+            base_mode = self.base_mode_var.get().strip()
+            if base_mode:
+                args += ["--base-mode", base_mode]
             base_thick = self.base_thickness_var.get().strip()
             if base_thick:
                 args += ["--base-thickness", base_thick]
@@ -767,17 +825,44 @@ class App(tk.Tk):
         if self.mode_var.get() == "auto":
             self.target_size_entry.configure(state="normal")
             self.target_res_entry.configure(state="normal")
+            self.target_edge_combo.configure(state="readonly")
             self.step_entry.configure(state="disabled")
             self.target_size_label.configure(foreground="#e2e8f0")
             self.target_res_label.configure(foreground="#e2e8f0")
+            self.target_edge_label.configure(foreground="#e2e8f0")
             self.step_label.configure(foreground="#6b7280")
         else:
             self.target_size_entry.configure(state="disabled")
             self.target_res_entry.configure(state="disabled")
+            self.target_edge_combo.configure(state="disabled")
             self.step_entry.configure(state="normal")
             self.target_size_label.configure(foreground="#6b7280")
             self.target_res_label.configure(foreground="#6b7280")
+            self.target_edge_label.configure(foreground="#6b7280")
             self.step_label.configure(foreground="#e2e8f0")
+
+    def _update_merge_controls(self) -> None:
+        make_solid = self.make_solid_var.get()
+        base_mode = self.base_mode_var.get()
+
+        if make_solid:
+            self.base_mode_combo.configure(state="readonly")
+            self.base_z_entry.configure(state="normal")
+            self.base_z_label.configure(foreground="#e2e8f0")
+            self.base_mode_label.configure(foreground="#e2e8f0")
+            if base_mode == "sealevel":
+                self.base_thickness_entry.configure(state="disabled")
+                self.base_thickness_label.configure(foreground="#6b7280")
+            else:
+                self.base_thickness_entry.configure(state="normal")
+                self.base_thickness_label.configure(foreground="#e2e8f0")
+        else:
+            self.base_mode_combo.configure(state="disabled")
+            self.base_thickness_entry.configure(state="disabled")
+            self.base_z_entry.configure(state="disabled")
+            self.base_mode_label.configure(foreground="#6b7280")
+            self.base_thickness_label.configure(foreground="#6b7280")
+            self.base_z_label.configure(foreground="#6b7280")
 
     def _set_status(self, key: str, text: str, color: str) -> None:
         var = self.status_vars.get(key)
