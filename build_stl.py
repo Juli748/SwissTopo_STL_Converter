@@ -317,7 +317,39 @@ def _prompt_optional_float(prompt: str) -> Optional[float]:
         if value <= 0:
             print("Value must be greater than zero.")
             continue
-        return value
+    return value
+
+
+def _parse_scale_ratio(raw: str) -> float:
+    """
+    Parse scale ratios like "100", "1:100", or "1/100" into a numeric ratio.
+    Returns the real-world : model ratio (e.g. "1:100" -> 100.0).
+    """
+    s = raw.strip()
+    if not s:
+        raise ValueError("Scale ratio is empty.")
+
+    if ":" in s:
+        parts = s.split(":")
+    elif "/" in s:
+        parts = s.split("/")
+    else:
+        parts = [s]
+
+    if len(parts) == 1:
+        ratio = float(parts[0])
+    elif len(parts) == 2:
+        a = float(parts[0])
+        b = float(parts[1])
+        if a == 0:
+            raise ValueError("Scale ratio numerator cannot be zero.")
+        ratio = b / a
+    else:
+        raise ValueError("Invalid scale ratio format.")
+
+    if ratio <= 0:
+        raise ValueError("Scale ratio must be > 0.")
+    return ratio
 
 
 def _auto_scale_and_step(
@@ -359,6 +391,26 @@ def _auto_scale_and_step(
     print(f"[AUTO] Output XY spacing: {spacing_mm:.3f} mm -> step={step}")
 
     return scale, step
+
+
+def _auto_step_from_scale(
+    input_files: List[Path],
+    *,
+    scale: float,
+    target_resolution_mm: float,
+) -> int:
+    _, _, _, _, min_spacing = scan_input_bounds_and_resolution(input_files)
+    spacing_mm = min_spacing * float(scale)
+    if spacing_mm <= 0:
+        raise ValueError("Computed spacing is not positive; check input resolution/scale.")
+    if target_resolution_mm <= 0:
+        raise ValueError("Target resolution must be > 0.")
+    step = max(1, int(math.ceil(target_resolution_mm / spacing_mm)))
+    print(f"[AUTO] Min XY spacing: {min_spacing:.6f}")
+    print(f"[AUTO] Scale factor: {float(scale):.6f} (input units -> mm)")
+    print(f"[AUTO] Target XY spacing: {target_resolution_mm:.2f} mm")
+    print(f"[AUTO] Output XY spacing: {spacing_mm:.3f} mm -> step={step}")
+    return step
 
 
 def _prompt_edge_mode() -> str:
@@ -1156,6 +1208,7 @@ def merge_stls_mesh(
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Convert XYZ/GeoTIFF terrain data to STL surface(s).")
+    input_tile_edge_units = 1000.0  # 1 km tiles, input units are meters by default.
     ap.add_argument(
         "--all",
         action="store_true",
@@ -1200,6 +1253,20 @@ def main() -> None:
         default=None,
         help="Target size of the chosen XY edge in mm. "
              "When set in --all mode, auto-compute scale and step from XYZ bounds/resolution.",
+    )
+    ap.add_argument(
+        "--tile-size-mm",
+        type=float,
+        default=None,
+        help="Target side length (mm) for a single 1 km input tile. "
+             "Sets a fixed scale (assumes 1 km = 1000 input units).",
+    )
+    ap.add_argument(
+        "--scale-ratio",
+        type=str,
+        default=None,
+        help="Map scale ratio like '100' or '1:100' (meaning 1 model unit = 100 real units). "
+             "Sets a fixed scale (assumes input units are meters).",
     )
     ap.add_argument(
         "--target-edge",
@@ -1271,6 +1338,16 @@ def main() -> None:
 
     if args.target_size_mm is not None and not args.all:
         ap.error("--target-size-mm can only be used with --all.")
+    if args.tile_size_mm is not None and not args.all:
+        ap.error("--tile-size-mm can only be used with --all.")
+    if args.scale_ratio is not None and not args.all:
+        ap.error("--scale-ratio can only be used with --all.")
+
+    scale_mode_count = sum(
+        1 for v in (args.target_size_mm, args.tile_size_mm, args.scale_ratio) if v is not None
+    )
+    if scale_mode_count > 1:
+        ap.error("Use only one of --target-size-mm, --tile-size-mm, or --scale-ratio.")
 
     if args.merge_stl is not None:
         # Load + weld for seamless joins; solidify once globally if requested.
@@ -1302,8 +1379,10 @@ def main() -> None:
         )
 
         target_size_mm = args.target_size_mm
+        tile_size_mm = args.tile_size_mm
+        scale_ratio = args.scale_ratio
         target_edge = str(args.target_edge)
-        if target_size_mm is None and args.step == 1 and sys.stdin.isatty():
+        if target_size_mm is None and tile_size_mm is None and scale_ratio is None and args.step == 1 and sys.stdin.isatty():
             target_edge = _prompt_edge_mode()
             edge_label = "shortest" if target_edge == "shortest" else "longest"
             target_size_mm = _prompt_optional_float(
@@ -1318,6 +1397,29 @@ def main() -> None:
                 target_size_mm=float(target_size_mm),
                 target_resolution_mm=float(args.target_resolution_mm),
                 edge_mode=target_edge,
+            )
+        elif tile_size_mm is not None:
+            auto_scale = float(tile_size_mm) / float(input_tile_edge_units)
+            print(
+                f"[SCALE] Tile size: {float(tile_size_mm):.2f} mm per 1 km tile "
+                f"-> scale {auto_scale:.6f} (input units -> mm)"
+            )
+            auto_step = _auto_step_from_scale(
+                input_files,
+                scale=float(auto_scale),
+                target_resolution_mm=float(args.target_resolution_mm),
+            )
+        elif scale_ratio is not None:
+            ratio = _parse_scale_ratio(str(scale_ratio))
+            auto_scale = 1000.0 / float(ratio)
+            print(
+                f"[SCALE] Map scale 1:{ratio:.6f} "
+                f"-> scale {auto_scale:.6f} (input units -> mm)"
+            )
+            auto_step = _auto_step_from_scale(
+                input_files,
+                scale=float(auto_scale),
+                target_resolution_mm=float(args.target_resolution_mm),
             )
 
         output_tiles_dir = Path("./output/tiles")

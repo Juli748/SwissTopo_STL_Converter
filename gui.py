@@ -288,9 +288,12 @@ class App(tk.Tk):
         frame.pack(fill=tk.X)
 
         self.mode_var = tk.StringVar(value=DEFAULTS["mode"])
+        self.scale_mode_var = tk.StringVar(value=DEFAULTS["scale_mode"])
         self.target_size_var = tk.StringVar(value=DEFAULTS["target_size_mm"])
         self.target_res_var = tk.StringVar(value=DEFAULTS["target_resolution_mm"])
         self.target_edge_var = tk.StringVar(value=DEFAULTS["target_edge"])
+        self.tile_size_var = tk.StringVar(value=DEFAULTS["tile_size_mm"])
+        self.scale_ratio_var = tk.StringVar(value=DEFAULTS["scale_ratio"])
         self.step_var = tk.StringVar(value=DEFAULTS["step"])
         self.tol_var = tk.StringVar(value=DEFAULTS["grid_tolerance"])
         self.z_scale_var = tk.StringVar(value=DEFAULTS["z_scale"])
@@ -314,13 +317,40 @@ class App(tk.Tk):
         )
         manual_radio.grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
 
+        scale_mode_label = ttk.Label(frame, text="Scale by:")
+        scale_mode_label.grid(row=1, column=0, sticky=tk.W, pady=4)
+        scale_target_radio = ttk.Radiobutton(
+            frame,
+            text="Target size (merged)",
+            value="target_size",
+            variable=self.scale_mode_var,
+            command=self._update_convert_mode,
+        )
+        scale_target_radio.grid(row=1, column=1, sticky=tk.W)
+        scale_tile_radio = ttk.Radiobutton(
+            frame,
+            text="Tile size (1 km)",
+            value="tile_size",
+            variable=self.scale_mode_var,
+            command=self._update_convert_mode,
+        )
+        scale_tile_radio.grid(row=1, column=2, sticky=tk.W, padx=(12, 0))
+        scale_ratio_radio = ttk.Radiobutton(
+            frame,
+            text="Scale ratio (1:100)",
+            value="scale_ratio",
+            variable=self.scale_mode_var,
+            command=self._update_convert_mode,
+        )
+        scale_ratio_radio.grid(row=1, column=3, sticky=tk.W)
+
         self.target_size_label = ttk.Label(frame, text="Target edge length (mm):")
-        self.target_size_label.grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.target_size_label.grid(row=2, column=0, sticky=tk.W, pady=4)
         self.target_size_entry = ttk.Entry(frame, textvariable=self.target_size_var, width=10)
-        self.target_size_entry.grid(row=1, column=1, sticky=tk.W)
+        self.target_size_entry.grid(row=2, column=1, sticky=tk.W)
 
         self.target_edge_label = ttk.Label(frame, text="Edge to fit:")
-        self.target_edge_label.grid(row=1, column=2, sticky=tk.W, padx=(12, 0))
+        self.target_edge_label.grid(row=2, column=2, sticky=tk.W, padx=(12, 0))
         self.target_edge_combo = ttk.Combobox(
             frame,
             textvariable=self.target_edge_var,
@@ -328,43 +358,53 @@ class App(tk.Tk):
             state="readonly",
             width=10,
         )
-        self.target_edge_combo.grid(row=1, column=3, sticky=tk.W)
+        self.target_edge_combo.grid(row=2, column=3, sticky=tk.W)
 
         self.target_res_label = ttk.Label(frame, text="Target XY spacing (mm):")
-        self.target_res_label.grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.target_res_label.grid(row=3, column=0, sticky=tk.W, pady=4)
         self.target_res_entry = ttk.Entry(frame, textvariable=self.target_res_var, width=10)
-        self.target_res_entry.grid(row=2, column=1, sticky=tk.W)
+        self.target_res_entry.grid(row=3, column=1, sticky=tk.W)
 
         self.step_label = ttk.Label(frame, text="Downsample step:")
-        self.step_label.grid(row=2, column=2, sticky=tk.W, padx=(12, 0))
+        self.step_label.grid(row=3, column=2, sticky=tk.W, padx=(12, 0))
         self.step_entry = ttk.Entry(frame, textvariable=self.step_var, width=10)
-        self.step_entry.grid(row=2, column=3, sticky=tk.W)
+        self.step_entry.grid(row=3, column=3, sticky=tk.W)
+
+        self.tile_size_label = ttk.Label(frame, text="Tile size (mm for 1 km):")
+        self.tile_size_label.grid(row=4, column=0, sticky=tk.W, pady=4)
+        self.tile_size_entry = ttk.Entry(frame, textvariable=self.tile_size_var, width=10)
+        self.tile_size_entry.grid(row=4, column=1, sticky=tk.W)
+
+        self.scale_ratio_label = ttk.Label(frame, text="Scale ratio (e.g. 1:100):")
+        self.scale_ratio_label.grid(row=4, column=2, sticky=tk.W, padx=(12, 0))
+        self.scale_ratio_entry = ttk.Entry(frame, textvariable=self.scale_ratio_var, width=10)
+        self.scale_ratio_entry.grid(row=4, column=3, sticky=tk.W)
 
         self.tol_label = ttk.Label(frame, text="Grid tolerance:")
-        self.tol_label.grid(row=3, column=0, sticky=tk.W, pady=4)
+        self.tol_label.grid(row=5, column=0, sticky=tk.W, pady=4)
         tol_entry = ttk.Entry(frame, textvariable=self.tol_var, width=10)
-        tol_entry.grid(row=3, column=1, sticky=tk.W)
+        tol_entry.grid(row=5, column=1, sticky=tk.W)
 
         self.z_scale_label = ttk.Label(frame, text="Z scale (tile conversion):")
-        self.z_scale_label.grid(row=3, column=2, sticky=tk.W, padx=(12, 0))
+        self.z_scale_label.grid(row=5, column=2, sticky=tk.W, padx=(12, 0))
         z_scale_entry = ttk.Entry(frame, textvariable=self.z_scale_var, width=10)
-        z_scale_entry.grid(row=3, column=3, sticky=tk.W)
+        z_scale_entry.grid(row=5, column=3, sticky=tk.W)
 
         auto_hint = ttk.Label(frame, text="Auto = program picks step to hit print size.")
-        auto_hint.grid(row=4, column=0, columnspan=3, sticky=tk.W)
+        auto_hint.grid(row=6, column=0, columnspan=3, sticky=tk.W)
 
         convert_workers_label = ttk.Label(frame, text="Max parallel conversions:")
-        convert_workers_label.grid(row=5, column=0, sticky=tk.W, pady=4)
+        convert_workers_label.grid(row=7, column=0, sticky=tk.W, pady=4)
         self.convert_workers_var = tk.StringVar(value=DEFAULTS["convert_workers"])
         convert_workers_entry = ttk.Entry(frame, textvariable=self.convert_workers_var, width=10)
-        convert_workers_entry.grid(row=5, column=1, sticky=tk.W)
+        convert_workers_entry.grid(row=7, column=1, sticky=tk.W)
 
         self.convert_btn = ttk.Button(frame, text="Run Conversion", command=self._run_convert)
-        self.convert_btn.grid(row=6, column=3, sticky=tk.E, padx=4, pady=6)
+        self.convert_btn.grid(row=8, column=3, sticky=tk.E, padx=4, pady=6)
         self.status_vars["convert"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["convert"] = ttk.Label(frame, textvariable=self.status_vars["convert"])
         self.status_labels["convert"].grid(
-            row=6, column=2, sticky=tk.W, padx=(12, 0)
+            row=8, column=2, sticky=tk.W, padx=(12, 0)
         )
         self.convert_progress = ttk.Progressbar(
             frame,
@@ -373,9 +413,9 @@ class App(tk.Tk):
             mode="determinate",
             length=220,
         )
-        self.convert_progress.grid(row=7, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress.grid(row=9, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.convert_progress_label = ttk.Label(frame, textvariable=self.convert_progress_label_var)
-        self.convert_progress_label.grid(row=7, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress_label.grid(row=9, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.convert_progress_label.configure(width=26)
 
         self._update_convert_mode()
@@ -392,6 +432,22 @@ class App(tk.Tk):
             Tooltip(
                 manual_radio,
                 "Manual: set the downsample step directly (keep every Nth point).",
+            ),
+            Tooltip(
+                scale_mode_label,
+                "Select how XY scale is defined for the tiles.",
+            ),
+            Tooltip(
+                scale_target_radio,
+                "Auto scale based on the chosen edge of the full merged area (--target-size-mm).",
+            ),
+            Tooltip(
+                scale_tile_radio,
+                "Set a fixed size for each 1 km input tile in mm (--tile-size-mm).",
+            ),
+            Tooltip(
+                scale_ratio_radio,
+                "Set a map scale like 1:100 (--scale-ratio). Assumes input units are meters.",
             ),
             Tooltip(
                 self.target_size_label,
@@ -424,6 +480,22 @@ class App(tk.Tk):
             Tooltip(
                 self.step_entry,
                 "Example: 10 keeps every 10th point.",
+            ),
+            Tooltip(
+                self.tile_size_label,
+                "Fixed tile side length in mm for a 1 km input tile (--tile-size-mm).",
+            ),
+            Tooltip(
+                self.tile_size_entry,
+                "Example: 200 makes each 1 km tile 200 mm wide.",
+            ),
+            Tooltip(
+                self.scale_ratio_label,
+                "Map scale like 1:100 or 100 (--scale-ratio).",
+            ),
+            Tooltip(
+                self.scale_ratio_entry,
+                "Example: 1:250 makes 1 mm on the model equal 250 mm real.",
             ),
             Tooltip(
                 self.tol_label,
@@ -673,12 +745,22 @@ class App(tk.Tk):
                 args.append("--clean-tiles")
 
         if self.mode_var.get() == "auto":
-            target_size = self.target_size_var.get().strip()
-            if target_size:
-                args += ["--target-size-mm", target_size]
-                target_edge = self.target_edge_var.get().strip()
-                if target_edge:
-                    args += ["--target-edge", target_edge]
+            scale_mode = self.scale_mode_var.get().strip()
+            if scale_mode == "target_size":
+                target_size = self.target_size_var.get().strip()
+                if target_size:
+                    args += ["--target-size-mm", target_size]
+                    target_edge = self.target_edge_var.get().strip()
+                    if target_edge:
+                        args += ["--target-edge", target_edge]
+            elif scale_mode == "tile_size":
+                tile_size = self.tile_size_var.get().strip()
+                if tile_size:
+                    args += ["--tile-size-mm", tile_size]
+            elif scale_mode == "scale_ratio":
+                scale_ratio = self.scale_ratio_var.get().strip()
+                if scale_ratio:
+                    args += ["--scale-ratio", scale_ratio]
             target_res = self.target_res_var.get().strip()
             if target_res:
                 args += ["--target-resolution-mm", target_res]
@@ -686,6 +768,15 @@ class App(tk.Tk):
             step = self.step_var.get().strip()
             if step:
                 args += ["--step", step]
+            scale_mode = self.scale_mode_var.get().strip()
+            if scale_mode == "tile_size":
+                tile_size = self.tile_size_var.get().strip()
+                if tile_size:
+                    args += ["--tile-size-mm", tile_size]
+            elif scale_mode == "scale_ratio":
+                scale_ratio = self.scale_ratio_var.get().strip()
+                if scale_ratio:
+                    args += ["--scale-ratio", scale_ratio]
 
         tol = self.tol_var.get().strip()
         if tol:
@@ -835,24 +926,33 @@ class App(tk.Tk):
             subprocess.Popen(["xdg-open", str(self.output_dir.resolve())])
 
     def _update_convert_mode(self) -> None:
-        if self.mode_var.get() == "auto":
-            self.target_size_entry.configure(state="normal")
-            self.target_res_entry.configure(state="normal")
-            self.target_edge_combo.configure(state="readonly")
-            self.step_entry.configure(state="disabled")
-            self.target_size_label.configure(foreground="#e2e8f0")
-            self.target_res_label.configure(foreground="#e2e8f0")
-            self.target_edge_label.configure(foreground="#e2e8f0")
-            self.step_label.configure(foreground="#6b7280")
-        else:
-            self.target_size_entry.configure(state="disabled")
-            self.target_res_entry.configure(state="disabled")
-            self.target_edge_combo.configure(state="disabled")
-            self.step_entry.configure(state="normal")
-            self.target_size_label.configure(foreground="#6b7280")
-            self.target_res_label.configure(foreground="#6b7280")
-            self.target_edge_label.configure(foreground="#6b7280")
-            self.step_label.configure(foreground="#e2e8f0")
+        if self.mode_var.get() != "auto" and self.scale_mode_var.get() == "target_size":
+            self.scale_mode_var.set("tile_size")
+        self._update_scale_mode()
+
+    def _update_scale_mode(self) -> None:
+        auto_mode = self.mode_var.get() == "auto"
+        scale_mode = self.scale_mode_var.get()
+
+        enable_target = auto_mode and scale_mode == "target_size"
+        enable_tile = scale_mode == "tile_size"
+        enable_ratio = scale_mode == "scale_ratio"
+        enable_step = not auto_mode
+        enable_res = auto_mode
+
+        self.target_size_entry.configure(state="normal" if enable_target else "disabled")
+        self.target_res_entry.configure(state="normal" if enable_res else "disabled")
+        self.target_edge_combo.configure(state="readonly" if enable_target else "disabled")
+        self.step_entry.configure(state="normal" if enable_step else "disabled")
+        self.tile_size_entry.configure(state="normal" if enable_tile else "disabled")
+        self.scale_ratio_entry.configure(state="normal" if enable_ratio else "disabled")
+
+        self.target_size_label.configure(foreground="#e2e8f0" if enable_target else "#6b7280")
+        self.target_res_label.configure(foreground="#e2e8f0" if enable_res else "#6b7280")
+        self.target_edge_label.configure(foreground="#e2e8f0" if enable_target else "#6b7280")
+        self.step_label.configure(foreground="#e2e8f0" if enable_step else "#6b7280")
+        self.tile_size_label.configure(foreground="#e2e8f0" if enable_tile else "#6b7280")
+        self.scale_ratio_label.configure(foreground="#e2e8f0" if enable_ratio else "#6b7280")
 
     def _update_merge_controls(self) -> None:
         make_solid = self.make_solid_var.get()
