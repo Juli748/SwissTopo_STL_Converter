@@ -1095,6 +1095,7 @@ def merge_stls_streaming(out_stl: Path, *, binary_out: bool, solid_name: str = "
                 if written % report_every == 0 or written == total_tris:
                     pct = (written / total_tris) * 100.0
                     print(f"[MERGE] Progress: {written:,}/{total_tris:,} triangles ({pct:.0f}%)")
+                print(f"[PROGRESS] {i}/{len(stl_files)} {p.name}")
 
         print(f"[MERGE] Done. Wrote {out_stl} with {total_tris:,} triangles.")
         return
@@ -1144,10 +1145,45 @@ def merge_stls_streaming(out_stl: Path, *, binary_out: bool, solid_name: str = "
                         out.write(line)
                         if s.startswith("facet normal"):
                             total_tris_streamed += 1
+            print(f"[PROGRESS] {i}/{len(stl_files)} {p.name}")
 
         out.write(f"endsolid {solid_name}\n")
 
     print(f"[MERGE] Done. Wrote {out_stl} with ~{total_tris_streamed:,} triangles.")
+
+
+def _iter_stl_triangles(path: Path):
+    """
+    Yield triangles from an STL file as ((ax, ay, az), (bx, by, bz), (cx, cy, cz)).
+    Uses a streaming reader to avoid loading the full mesh into memory.
+    """
+    if _is_probably_binary_stl(path):
+        with path.open("rb") as f:
+            f.seek(80)
+            n = int.from_bytes(f.read(4), "little", signed=False)
+            for _ in range(n):
+                rec = f.read(50)
+                if len(rec) != 50:
+                    break
+                vals = struct.unpack("<12fH", rec)
+                yield (
+                    (float(vals[3]), float(vals[4]), float(vals[5])),
+                    (float(vals[6]), float(vals[7]), float(vals[8])),
+                    (float(vals[9]), float(vals[10]), float(vals[11])),
+                )
+        return
+
+    tri: List[Tuple[float, float, float]] = []
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if s.startswith("vertex"):
+                parts = s.split()
+                if len(parts) >= 4:
+                    tri.append((float(parts[1]), float(parts[2]), float(parts[3])))
+                    if len(tri) == 3:
+                        yield (tri[0], tri[1], tri[2])
+                        tri = []
 
 
 def merge_stls_mesh(
@@ -1163,24 +1199,67 @@ def merge_stls_mesh(
     z_scale: float,
 ) -> None:
     """
-    Full merge that loads all tiles into memory, welds vertices, and can solidify globally.
+    Full merge that streams tiles, welds vertices on the fly, and can solidify globally.
+    This avoids holding all tile meshes in memory at once.
     """
     stl_files = _list_stl_files()
     print(f"Found {len(stl_files)} STL file(s) under ./output/tiles")
     print(f"[MERGE-MESH] Output: {out_stl}")
 
-    meshes: List[Mesh] = []
+    use_weld = float(weld_tol) > 0.0
+    if use_weld:
+        print(f"[MERGE-MESH] Welding on the fly with tol={float(weld_tol)}")
+
+    mapping: Dict[Tuple[int, int, int], int] = {} if use_weld else {}
+    new_verts: List[Tuple[float, float, float]] = []
+    new_faces: List[Tuple[int, int, int]] = []
+    raw_vertices = 0
+    raw_tris = 0
+
     for i, p in enumerate(stl_files, 1):
         print("\n" + "=" * 80)
         print(f"[MERGE-MESH] ({i}/{len(stl_files)}) Reading {p}")
         print("=" * 80)
-        meshes.append(read_stl_to_mesh(p))
+        for a, b, c in _iter_stl_triangles(p):
+            raw_tris += 1
+            raw_vertices += 3
 
-    merged = concat_meshes(meshes)
-    print(f"[MERGE-MESH] Combined raw vertices: {merged.vertices.shape[0]:,} | triangles: {merged.faces.shape[0]:,}")
+            if use_weld:
+                ia = mapping.get((int(round(a[0] / weld_tol)), int(round(a[1] / weld_tol)), int(round(a[2] / weld_tol))))
+                if ia is None:
+                    ia = len(new_verts)
+                    mapping[(int(round(a[0] / weld_tol)), int(round(a[1] / weld_tol)), int(round(a[2] / weld_tol)))] = ia
+                    new_verts.append(a)
 
-    # Welding is the key to removing internal tile boundaries
-    merged = weld_vertices(merged, weld_tol=float(weld_tol))
+                ib = mapping.get((int(round(b[0] / weld_tol)), int(round(b[1] / weld_tol)), int(round(b[2] / weld_tol))))
+                if ib is None:
+                    ib = len(new_verts)
+                    mapping[(int(round(b[0] / weld_tol)), int(round(b[1] / weld_tol)), int(round(b[2] / weld_tol)))] = ib
+                    new_verts.append(b)
+
+                ic = mapping.get((int(round(c[0] / weld_tol)), int(round(c[1] / weld_tol)), int(round(c[2] / weld_tol))))
+                if ic is None:
+                    ic = len(new_verts)
+                    mapping[(int(round(c[0] / weld_tol)), int(round(c[1] / weld_tol)), int(round(c[2] / weld_tol)))] = ic
+                    new_verts.append(c)
+            else:
+                ia = len(new_verts)
+                new_verts.append(a)
+                ib = len(new_verts)
+                new_verts.append(b)
+                ic = len(new_verts)
+                new_verts.append(c)
+
+            new_faces.append((ia, ib, ic))
+        print(f"[PROGRESS] {i}/{len(stl_files)} {p.name}")
+
+    merged = Mesh(
+        vertices=np.asarray(new_verts, dtype=np.float64),
+        faces=np.asarray(new_faces, dtype=np.int64),
+    )
+    print(
+        f"[MERGE-MESH] Combined raw vertices: {raw_vertices:,} -> {merged.vertices.shape[0]:,} | triangles: {merged.faces.shape[0]:,}"
+    )
 
     if z_scale != 1.0:
         merged = scale_mesh_z(merged, float(z_scale))

@@ -93,6 +93,8 @@ class App(tk.Tk):
         self.download_progress_label_var = tk.StringVar(value="")
         self.convert_progress_var = tk.DoubleVar(value=0.0)
         self.convert_progress_label_var = tk.StringVar(value="")
+        self.merge_progress_var = tk.DoubleVar(value=0.0)
+        self.merge_progress_label_var = tk.StringVar(value="")
 
         self._setup_theme()
         self._build_ui()
@@ -144,8 +146,31 @@ class App(tk.Tk):
         style.configure("TSeparator", background="#1f2937")
 
     def _build_ui(self) -> None:
-        main = ttk.Frame(self, padding=12)
-        main.pack(fill=tk.BOTH, expand=True)
+        root = ttk.Frame(self)
+        root.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(root, bg="#0f172a", highlightthickness=0)
+        scrollbar = ttk.Scrollbar(root, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main = ttk.Frame(canvas, padding=12)
+        window_id = canvas.create_window((0, 0), window=main, anchor="nw")
+
+        def _sync_scrollregion(_event: tk.Event) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _sync_width(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+
+        main.bind("<Configure>", _sync_scrollregion)
+        canvas.bind("<Configure>", _sync_width)
+        self._scroll_canvas = canvas
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_mousewheel, add="+")
 
         header = ttk.Frame(main)
         header.pack(fill=tk.X, pady=(0, 8))
@@ -196,6 +221,29 @@ class App(tk.Tk):
         buttons.pack(fill=tk.X, pady=8)
         ttk.Button(buttons, text="Clear Log", command=self._clear_log).pack(side=tk.LEFT)
         ttk.Button(buttons, text="Open Output Folder", command=self._open_output_folder).pack(side=tk.RIGHT)
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        canvas = getattr(self, "_scroll_canvas", None)
+        if canvas is None:
+            return
+        target = canvas.winfo_containing(event.x_root, event.y_root)
+        if target is None:
+            return
+        widget = target
+        inside_canvas = False
+        while widget is not None:
+            if widget is canvas:
+                inside_canvas = True
+                break
+            widget = widget.master
+        if not inside_canvas:
+            return
+        if hasattr(event, "delta") and event.delta:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        elif getattr(event, "num", None) == 4:
+            canvas.yview_scroll(-3, "units")
+        elif getattr(event, "num", None) == 5:
+            canvas.yview_scroll(3, "units")
 
     def _build_step_download(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="1) Download XYZ/TIF tiles")
@@ -596,6 +644,19 @@ class App(tk.Tk):
         self.status_labels["merge"].grid(
             row=4, column=3, sticky=tk.W, padx=(12, 0)
         )
+        self.status_labels["merge"].configure(width=12)
+
+        self.merge_progress = ttk.Progressbar(
+            frame,
+            variable=self.merge_progress_var,
+            maximum=100.0,
+            mode="determinate",
+            length=220,
+        )
+        self.merge_progress.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.merge_progress_label = ttk.Label(frame, textvariable=self.merge_progress_label_var)
+        self.merge_progress_label.grid(row=5, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.merge_progress_label.configure(width=26)
 
         frame.columnconfigure(1, weight=1)
 
@@ -797,6 +858,8 @@ class App(tk.Tk):
         self._run_command(args, "Convert tiles", status_key="convert")
 
     def _run_merge(self) -> None:
+        self.merge_progress_var.set(0.0)
+        self.merge_progress_label_var.set("")
         out_path = self.merge_out_var.get().strip()
         if not out_path:
             messagebox.showwarning("Missing output", "Please choose an output STL path.")
@@ -909,6 +972,9 @@ class App(tk.Tk):
         elif self.current_status_key == "convert":
             self.convert_progress_var.set(pct)
             self.convert_progress_label_var.set(f"Converted {current} of {total} ({name})")
+        elif self.current_status_key == "merge":
+            self.merge_progress_var.set(pct)
+            self.merge_progress_label_var.set(f"Merged {current} of {total} ({name})")
 
     def _log(self, message: str) -> None:
         self.log_text.insert(tk.END, message + "\n")
