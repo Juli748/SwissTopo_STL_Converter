@@ -75,6 +75,7 @@ class App(tk.Tk):
         self.xyz_dir = self.data_dir / "xyz"
         self.output_dir = Path(__file__).resolve().parent / "output"
         self.tiles_dir = self.output_dir / "tiles"
+        self.borders_dir = Path(__file__).resolve().parent / "borders"
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.xyz_dir.mkdir(parents=True, exist_ok=True)
@@ -95,6 +96,11 @@ class App(tk.Tk):
         self.convert_progress_label_var = tk.StringVar(value="")
         self.merge_progress_var = tk.DoubleVar(value=0.0)
         self.merge_progress_label_var = tk.StringVar(value="")
+        self.merge_border_mode_var = tk.StringVar(value=DEFAULTS["merge_border_mode"])
+        self.border_scale_var = tk.StringVar(value=DEFAULTS["border_scale"])
+        self.border_options = self._discover_border_shp()
+        default_border_label = self._select_default_border_label()
+        self.border_shp_var = tk.StringVar(value=default_border_label)
 
         self._setup_theme()
         self._build_ui()
@@ -637,12 +643,47 @@ class App(tk.Tk):
         self.base_z_entry = ttk.Entry(frame, textvariable=self.base_z_var, width=10)
         self.base_z_entry.grid(row=3, column=1, sticky=tk.W)
 
+        border_mode_label = ttk.Label(frame, text="Border clipping:")
+        border_mode_label.grid(row=4, column=0, sticky=tk.W, pady=2)
+        border_all_radio = ttk.Radiobutton(
+            frame,
+            text="Merge all tiles",
+            value="all",
+            variable=self.merge_border_mode_var,
+            command=self._update_merge_controls,
+        )
+        border_all_radio.grid(row=4, column=1, sticky=tk.W)
+        border_clip_radio = ttk.Radiobutton(
+            frame,
+            text="Clip to Swiss border",
+            value="clip",
+            variable=self.merge_border_mode_var,
+            command=self._update_merge_controls,
+        )
+        border_clip_radio.grid(row=4, column=2, sticky=tk.W, padx=(12, 0))
+
+        self.border_shp_label = ttk.Label(frame, text="Border shapefile:")
+        self.border_shp_label.grid(row=5, column=0, sticky=tk.W, pady=2)
+        self.border_shp_combo = ttk.Combobox(
+            frame,
+            textvariable=self.border_shp_var,
+            values=sorted(self.border_options.keys()),
+            state="readonly",
+            width=68,
+        )
+        self.border_shp_combo.grid(row=5, column=1, columnspan=3, sticky=tk.EW)
+
+        self.border_scale_label = ttk.Label(frame, text="Border scale:")
+        self.border_scale_label.grid(row=5, column=4, sticky=tk.W, pady=2)
+        self.border_scale_entry = ttk.Entry(frame, textvariable=self.border_scale_var, width=10)
+        self.border_scale_entry.grid(row=5, column=5, sticky=tk.W)
+
         self.merge_btn = ttk.Button(frame, text="Run Merge", command=self._run_merge)
-        self.merge_btn.grid(row=4, column=4, sticky=tk.E, padx=4, pady=6)
+        self.merge_btn.grid(row=6, column=5, sticky=tk.E, padx=4, pady=6)
         self.status_vars["merge"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["merge"] = ttk.Label(frame, textvariable=self.status_vars["merge"])
         self.status_labels["merge"].grid(
-            row=4, column=3, sticky=tk.W, padx=(12, 0)
+            row=6, column=3, sticky=tk.W, padx=(12, 0)
         )
         self.status_labels["merge"].configure(width=12)
 
@@ -653,12 +694,14 @@ class App(tk.Tk):
             mode="determinate",
             length=220,
         )
-        self.merge_progress.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.merge_progress.grid(row=7, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.merge_progress_label = ttk.Label(frame, textvariable=self.merge_progress_label_var)
-        self.merge_progress_label.grid(row=5, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.merge_progress_label.grid(row=7, column=3, columnspan=3, sticky=tk.W, pady=(4, 0))
         self.merge_progress_label.configure(width=26)
 
         frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(2, weight=1)
+        frame.columnconfigure(3, weight=1)
 
         self.tooltips += [
             Tooltip(
@@ -718,12 +761,65 @@ class App(tk.Tk):
                 "Leave blank to use base thickness instead.",
             ),
             Tooltip(
+                border_mode_label,
+                "Choose whether to merge all tiles or clip to the Swiss border.",
+            ),
+            Tooltip(
+                border_all_radio,
+                "Merges all tiles as-is without trimming.",
+            ),
+            Tooltip(
+                border_clip_radio,
+                "Trims triangles outside the Swiss border geometry.",
+            ),
+            Tooltip(
+                self.border_shp_label,
+                "Select the border dataset from ./borders (country boundary recommended).",
+            ),
+            Tooltip(
+                self.border_shp_combo,
+                "Uses the selected .shp file for clipping. LANDESGEBIET is the country outline.",
+            ),
+            Tooltip(
+                self.border_scale_label,
+                "Scale factor applied to the border coordinates to match STL units.",
+            ),
+            Tooltip(
+                self.border_scale_entry,
+                "Use 'auto' to reuse the last conversion scale (output/tiles/scale_info.json).",
+            ),
+            Tooltip(
                 self.merge_btn,
                 "Runs build_stl.py --merge-stl with the selected options.",
             ),
         ]
 
         self._update_merge_controls()
+
+    def _discover_border_shp(self) -> dict[str, Path]:
+        options: dict[str, Path] = {}
+        if not self.borders_dir.exists():
+            return options
+        for shp in sorted(self.borders_dir.rglob("*.shp")):
+            if not shp.is_file():
+                continue
+            label = str(shp.relative_to(self.borders_dir))
+            options[label] = shp
+        return options
+
+    def _select_default_border_label(self) -> str:
+        default_raw = DEFAULTS.get("border_shp", "").strip()
+        if default_raw:
+            default_path = Path(default_raw)
+            if default_path.exists():
+                try:
+                    return str(default_path.relative_to(self.borders_dir))
+                except ValueError:
+                    return str(default_path)
+        if not self.border_options:
+            return ""
+        preferred = [label for label in self.border_options if "LANDESGEBIET" in label.upper()]
+        return sorted(preferred or list(self.border_options.keys()))[0]
 
     def _browse_csv(self) -> None:
         path = filedialog.askopenfilename(
@@ -890,6 +986,19 @@ class App(tk.Tk):
             if base_z:
                 args += ["--base-z", base_z]
 
+        if self.merge_border_mode_var.get() == "clip":
+            if not self.border_options:
+                messagebox.showerror("Missing borders", "No border shapefiles found in ./borders.")
+                return
+            args.append("--clip-border")
+            border_label = self.border_shp_var.get().strip()
+            if border_label:
+                border_path = self.border_options.get(border_label, Path(border_label))
+                args += ["--border-shp", str(border_path)]
+            border_scale = self.border_scale_var.get().strip()
+            if border_scale:
+                args += ["--border-scale", border_scale]
+
         model_name = self.model_name_var.get().strip()
         if model_name:
             args += ["--model-name", model_name]
@@ -1023,6 +1132,9 @@ class App(tk.Tk):
     def _update_merge_controls(self) -> None:
         make_solid = self.make_solid_var.get()
         base_mode = self.base_mode_var.get()
+        border_mode = self.merge_border_mode_var.get()
+        border_available = bool(self.border_options)
+        clip_border = border_mode == "clip" and border_available
 
         if make_solid:
             self.base_mode_combo.configure(state="readonly")
@@ -1042,6 +1154,15 @@ class App(tk.Tk):
             self.base_mode_label.configure(foreground="#6b7280")
             self.base_thickness_label.configure(foreground="#6b7280")
             self.base_z_label.configure(foreground="#6b7280")
+
+        if not border_available:
+            self.merge_border_mode_var.set("all")
+            clip_border = False
+
+        self.border_shp_combo.configure(state="readonly" if border_available else "disabled")
+        self.border_scale_entry.configure(state="normal" if clip_border else "disabled")
+        self.border_shp_label.configure(foreground="#e2e8f0" if border_available else "#6b7280")
+        self.border_scale_label.configure(foreground="#e2e8f0" if clip_border else "#6b7280")
 
     def _set_status(self, key: str, text: str, color: str) -> None:
         var = self.status_vars.get(key)

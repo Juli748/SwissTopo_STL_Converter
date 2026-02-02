@@ -64,6 +64,11 @@ Optional (only needed for GeoTIFF / COG input):
 py -3 -m pip install rasterio
 ```
 
+Optional (only needed for Swiss border clipping):
+```bash
+py -3 -m pip install shapely pyshp
+```
+
 **Optional: Use Conda instead of the system Python**
 ```bash
 conda create -n swisstopo-stl python=3.11 -y
@@ -151,6 +156,10 @@ This step merges all tiles in `output/tiles` into a single STL and optionally ad
 - **Make solid**: Adds side walls and a flat base for printing.
   - **Base thickness**: Base thickness below the minimum elevation.
   - **Base Z (optional)**: Explicit base elevation (overrides thickness).
+- **Border clipping**: Choose whether to merge all tiles or clip to a Swiss border shapefile.
+  - **Clip to Swiss border**: Trims triangles outside the selected border geometry.
+  - **Border shapefile**: Pick a `.shp` from `./borders` (LANDESGEBIET is the country outline).
+  - **Border scale**: Scale factor for border coordinates. Use `auto` to reuse the tile scale stored in `output/tiles/scale_info.json` (falls back to `1.0`).
 
 ---
 
@@ -174,6 +183,10 @@ project/
       tile_002.stl
       tile_003.stl
     terrain.stl
+  borders/
+    LANDESGEBIET.shp
+    LANDESGEBIET.shx
+    LANDESGEBIET.dbf
 ```
 
 ---
@@ -186,6 +199,7 @@ Everything the GUI does is available via CLI if you prefer:
 python download_tiles.py --csv path/to/urls.csv
 python build_stl.py --all --target-size-mm 150
 python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001 --make-solid
+python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp borders/LANDESGEBIET.shp --border-scale auto
 ```
 
 ---

@@ -29,6 +29,7 @@ Global solid (important for printing):
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import shutil
 import struct
@@ -1186,6 +1187,172 @@ def _iter_stl_triangles(path: Path):
                         tri = []
 
 
+def _read_last_scale_info(path: Path) -> Optional[float]:
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = data.get("scale_xy")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _default_border_shp() -> Optional[Path]:
+    borders_dir = Path(__file__).resolve().parent / "borders"
+    if not borders_dir.exists():
+        return None
+    shp_files = [p for p in borders_dir.rglob("*.shp") if p.is_file()]
+    if not shp_files:
+        return None
+    preferred = [p for p in shp_files if "LANDESGEBIET" in p.name.upper()]
+    return sorted(preferred or shp_files)[0]
+
+
+def _parse_border_scale(raw: str, tiles_dir: Path) -> float:
+    value = raw.strip().lower()
+    if value in {"", "auto"}:
+        scale = _read_last_scale_info(tiles_dir / "scale_info.json")
+        if scale is None:
+            print("[WARN] Border scale set to auto but no scale_info.json found; using 1.0")
+            return 1.0
+        print(f"[BORDER] Using stored tile scale {scale:.6f}")
+        return float(scale)
+    if ":" in value or "/" in value:
+        ratio = _parse_scale_ratio(value)
+        return 1000.0 / float(ratio)
+    return float(value)
+
+
+def _load_border_geometry(shp_path: Path):
+    try:
+        import shapefile  # pyshp
+        from shapely.geometry import shape as shapely_shape
+        from shapely.ops import unary_union
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Border clipping requires 'pyshp' and 'shapely'. "
+            "Install with: pip install pyshp shapely"
+        ) from exc
+
+    if not shp_path.exists():
+        raise FileNotFoundError(f"Border shapefile not found: {shp_path}")
+
+    reader = shapefile.Reader(str(shp_path))
+    geoms = []
+    for shp in reader.shapes():
+        geom = shapely_shape(shp.__geo_interface__)
+        if geom.is_empty:
+            continue
+        if geom.geom_type not in {"Polygon", "MultiPolygon"}:
+            continue
+        geoms.append(geom)
+
+    if not geoms:
+        raise ValueError(f"No polygon geometries found in {shp_path}")
+
+    return unary_union(geoms)
+
+
+def _scale_border_geometry(geom, scale: float):
+    if scale == 1.0:
+        return geom
+    try:
+        from shapely.affinity import scale as shapely_scale
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Border clipping requires 'shapely'. Install with: pip install shapely"
+        ) from exc
+    return shapely_scale(geom, xfact=scale, yfact=scale, origin=(0.0, 0.0))
+
+
+def _interp_z_from_triangle(
+    a: Tuple[float, float, float],
+    b: Tuple[float, float, float],
+    c: Tuple[float, float, float],
+    x: float,
+    y: float,
+) -> float:
+    ax, ay, az = a
+    bx, by, bz = b
+    cx, cy, cz = c
+    denom = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy)
+    if abs(denom) < 1e-12:
+        return (az + bz + cz) / 3.0
+    w1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / denom
+    w2 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / denom
+    w3 = 1.0 - w1 - w2
+    return w1 * az + w2 * bz + w3 * cz
+
+
+def _triangulate_intersection(geom):
+    try:
+        from shapely.geometry import Polygon, MultiPolygon, GeometryCollection
+        from shapely.ops import triangulate
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Border clipping requires 'shapely'. Install with: pip install shapely"
+        ) from exc
+
+    if geom.is_empty:
+        return []
+
+    polys = []
+    if isinstance(geom, Polygon):
+        polys = [geom]
+    elif isinstance(geom, MultiPolygon):
+        polys = list(geom.geoms)
+    elif isinstance(geom, GeometryCollection):
+        polys = [g for g in geom.geoms if isinstance(g, (Polygon, MultiPolygon))]
+
+    triangles_2d = []
+    for poly in polys:
+        if poly.is_empty or poly.area == 0.0:
+            continue
+        for tri in triangulate(poly):
+            if not poly.covers(tri.representative_point()):
+                continue
+            coords = list(tri.exterior.coords)
+            if len(coords) < 4:
+                continue
+            triangles_2d.append(coords[:3])
+    return triangles_2d
+
+
+def _clip_triangle_to_border(
+    a: Tuple[float, float, float],
+    b: Tuple[float, float, float],
+    c: Tuple[float, float, float],
+    border_geom,
+    border_prep,
+) -> List[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]]:
+    try:
+        from shapely.geometry import Polygon
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Border clipping requires 'shapely'. Install with: pip install shapely"
+        ) from exc
+
+    tri_poly = Polygon([(a[0], a[1]), (b[0], b[1]), (c[0], c[1])])
+    if border_prep.covers(tri_poly):
+        return [(a, b, c)]
+    if not border_prep.intersects(tri_poly):
+        return []
+    inter = tri_poly.intersection(border_geom)
+    clipped_tris: List[Tuple[Tuple[float, float, float], Tuple[float, float, float], Tuple[float, float, float]]] = []
+    for tri2d in _triangulate_intersection(inter):
+        pts3d = []
+        for x, y in tri2d:
+            z = _interp_z_from_triangle(a, b, c, float(x), float(y))
+            pts3d.append((float(x), float(y), float(z)))
+        if len(pts3d) == 3:
+            clipped_tris.append((pts3d[0], pts3d[1], pts3d[2]))
+    return clipped_tris
+
+
 def merge_stls_mesh(
     out_stl: Path,
     *,
@@ -1197,6 +1364,8 @@ def merge_stls_mesh(
     base_z_value: Optional[float],
     base_mode: str,
     z_scale: float,
+    clip_border: bool = False,
+    border_geom=None,
 ) -> None:
     """
     Full merge that streams tiles, welds vertices on the fly, and can solidify globally.
@@ -1209,6 +1378,19 @@ def merge_stls_mesh(
     use_weld = float(weld_tol) > 0.0
     if use_weld:
         print(f"[MERGE-MESH] Welding on the fly with tol={float(weld_tol)}")
+
+    border_prep = None
+    if clip_border:
+        if border_geom is None:
+            raise ValueError("clip_border is True but no border geometry was provided.")
+        try:
+            from shapely.prepared import prep
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "Border clipping requires 'shapely'. Install with: pip install shapely"
+            ) from exc
+        border_prep = prep(border_geom)
+        print("[MERGE-MESH] Clipping triangles to border geometry")
 
     mapping: Dict[Tuple[int, int, int], int] = {} if use_weld else {}
     new_verts: List[Tuple[float, float, float]] = []
@@ -1224,33 +1406,53 @@ def merge_stls_mesh(
             raw_tris += 1
             raw_vertices += 3
 
-            if use_weld:
-                ia = mapping.get((int(round(a[0] / weld_tol)), int(round(a[1] / weld_tol)), int(round(a[2] / weld_tol))))
-                if ia is None:
+            tri_list = [(a, b, c)]
+            if clip_border:
+                assert border_prep is not None
+                tri_list = _clip_triangle_to_border(a, b, c, border_geom, border_prep)
+                if not tri_list:
+                    continue
+
+            for ta, tb, tc in tri_list:
+                if use_weld:
+                    ia = mapping.get(
+                        (int(round(ta[0] / weld_tol)), int(round(ta[1] / weld_tol)), int(round(ta[2] / weld_tol)))
+                    )
+                    if ia is None:
+                        ia = len(new_verts)
+                        mapping[
+                            (int(round(ta[0] / weld_tol)), int(round(ta[1] / weld_tol)), int(round(ta[2] / weld_tol)))
+                        ] = ia
+                        new_verts.append(ta)
+
+                    ib = mapping.get(
+                        (int(round(tb[0] / weld_tol)), int(round(tb[1] / weld_tol)), int(round(tb[2] / weld_tol)))
+                    )
+                    if ib is None:
+                        ib = len(new_verts)
+                        mapping[
+                            (int(round(tb[0] / weld_tol)), int(round(tb[1] / weld_tol)), int(round(tb[2] / weld_tol)))
+                        ] = ib
+                        new_verts.append(tb)
+
+                    ic = mapping.get(
+                        (int(round(tc[0] / weld_tol)), int(round(tc[1] / weld_tol)), int(round(tc[2] / weld_tol)))
+                    )
+                    if ic is None:
+                        ic = len(new_verts)
+                        mapping[
+                            (int(round(tc[0] / weld_tol)), int(round(tc[1] / weld_tol)), int(round(tc[2] / weld_tol)))
+                        ] = ic
+                        new_verts.append(tc)
+                else:
                     ia = len(new_verts)
-                    mapping[(int(round(a[0] / weld_tol)), int(round(a[1] / weld_tol)), int(round(a[2] / weld_tol)))] = ia
-                    new_verts.append(a)
-
-                ib = mapping.get((int(round(b[0] / weld_tol)), int(round(b[1] / weld_tol)), int(round(b[2] / weld_tol))))
-                if ib is None:
+                    new_verts.append(ta)
                     ib = len(new_verts)
-                    mapping[(int(round(b[0] / weld_tol)), int(round(b[1] / weld_tol)), int(round(b[2] / weld_tol)))] = ib
-                    new_verts.append(b)
-
-                ic = mapping.get((int(round(c[0] / weld_tol)), int(round(c[1] / weld_tol)), int(round(c[2] / weld_tol))))
-                if ic is None:
+                    new_verts.append(tb)
                     ic = len(new_verts)
-                    mapping[(int(round(c[0] / weld_tol)), int(round(c[1] / weld_tol)), int(round(c[2] / weld_tol)))] = ic
-                    new_verts.append(c)
-            else:
-                ia = len(new_verts)
-                new_verts.append(a)
-                ib = len(new_verts)
-                new_verts.append(b)
-                ic = len(new_verts)
-                new_verts.append(c)
+                    new_verts.append(tc)
 
-            new_faces.append((ia, ib, ic))
+                new_faces.append((ia, ib, ic))
         print(f"[PROGRESS] {i}/{len(stl_files)} {p.name}")
 
     merged = Mesh(
@@ -1298,6 +1500,24 @@ def main() -> None:
         type=Path,
         default=None,
         help="Merge existing .stl files found under ./output/tiles into one combined STL (no XYZ processing).",
+    )
+    ap.add_argument(
+        "--clip-border",
+        action="store_true",
+        help="Clip merged STL to the Swiss border (requires --merge-stl).",
+    )
+    ap.add_argument(
+        "--border-shp",
+        type=Path,
+        default=None,
+        help="Path to a Swiss border .shp file (default: auto-detect from ./borders).",
+    )
+    ap.add_argument(
+        "--border-scale",
+        type=str,
+        default="auto",
+        help="Scale factor to apply to border coordinates to match STL units. "
+             "Use a number (e.g. 10) or 'auto' to reuse the last conversion scale.",
     )
 
     ap.add_argument(
@@ -1429,6 +1649,18 @@ def main() -> None:
         ap.error("Use only one of --target-size-mm, --tile-size-mm, or --scale-ratio.")
 
     if args.merge_stl is not None:
+        border_geom = None
+        if args.clip_border:
+            border_path = args.border_shp or _default_border_shp()
+            if border_path is None:
+                ap.error("--clip-border requested but no border shapefile was found in ./borders.")
+            border_scale = _parse_border_scale(str(args.border_scale), Path("./output/tiles"))
+            print(f"[BORDER] Loading border from {border_path}")
+            border_geom = _load_border_geometry(border_path)
+            if border_scale != 1.0:
+                print(f"[BORDER] Scaling border by {border_scale:.6f}")
+                border_geom = _scale_border_geometry(border_geom, float(border_scale))
+
         # Load + weld for seamless joins; solidify once globally if requested.
         merge_name = args.model_name.strip() or "terrain_merged"
         merge_stls_mesh(
@@ -1441,6 +1673,8 @@ def main() -> None:
             base_z_value=args.base_z,
             base_mode=str(args.base_mode),
             z_scale=float(args.merge_z_scale),
+            clip_border=bool(args.clip_border),
+            border_geom=border_geom,
         )
         return
 
@@ -1512,6 +1746,20 @@ def main() -> None:
                 except OSError:
                     print(f"[WARN] Failed to remove: {existing.name}")
         output_tiles_dir.mkdir(parents=True, exist_ok=True)
+        scale_info_path = output_tiles_dir / "scale_info.json"
+        try:
+            scale_info_path.write_text(
+                json.dumps(
+                    {
+                        "scale_xy": float(auto_scale),
+                        "z_scale": float(args.z_scale),
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        except OSError:
+            print(f"[WARN] Failed to write {scale_info_path}")
 
         tasks: List[Tuple[Path, Path, str, float, float, float, int, float, Optional[float], str, bool]] = []
         model_name = args.model_name.strip()

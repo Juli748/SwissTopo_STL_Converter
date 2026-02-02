@@ -22,5 +22,8 @@ DEFAULTS = {
     "base_thickness": "5.0",
     "base_z": "",
     "base_mode": "fixed",
+    "merge_border_mode": "all",
+    "border_shp": "",
+    "border_scale": "auto",
     "status_idle": "",
 }
