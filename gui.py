@@ -240,6 +240,8 @@ class App(tk.Tk):
         target = canvas.winfo_containing(event.x_root, event.y_root)
         if target is None:
             return
+        if isinstance(target, tk.Listbox):
+            return
         widget = target
         inside_canvas = False
         while widget is not None:
@@ -255,6 +257,18 @@ class App(tk.Tk):
             canvas.yview_scroll(-3, "units")
         elif getattr(event, "num", None) == 5:
             canvas.yview_scroll(3, "units")
+
+    def _on_listbox_mousewheel(self, event: tk.Event) -> str:
+        listbox = self.border_keep_list
+        if listbox is None:
+            return "break"
+        if hasattr(event, "delta") and event.delta:
+            listbox.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        elif getattr(event, "num", None) == 4:
+            listbox.yview_scroll(-3, "units")
+        elif getattr(event, "num", None) == 5:
+            listbox.yview_scroll(3, "units")
+        return "break"
 
     def _build_step_download(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="1) Download XYZ/TIF tiles")
@@ -660,7 +674,7 @@ class App(tk.Tk):
         border_all_radio.grid(row=4, column=1, sticky=tk.W)
         border_clip_radio = ttk.Radiobutton(
             frame,
-            text="Clip to Swiss border",
+            text="Clip to selected border",
             value="clip",
             variable=self.merge_border_mode_var,
             command=self._update_merge_controls,
@@ -699,6 +713,9 @@ class App(tk.Tk):
             selectforeground="#f8fafc",
         )
         self.border_keep_list.grid(row=6, column=1, columnspan=3, sticky=tk.EW)
+        self.border_keep_list.bind("<MouseWheel>", self._on_listbox_mousewheel)
+        self.border_keep_list.bind("<Button-4>", self._on_listbox_mousewheel)
+        self.border_keep_list.bind("<Button-5>", self._on_listbox_mousewheel)
         self.border_keep_refresh_btn = ttk.Button(
             frame,
             text="Detect touched",
@@ -790,7 +807,7 @@ class App(tk.Tk):
             ),
             Tooltip(
                 border_mode_label,
-                "Choose whether to merge all tiles or clip to the Swiss border.",
+                "Choose whether to merge all tiles or clip to the selected border.",
             ),
             Tooltip(
                 border_all_radio,
@@ -798,7 +815,7 @@ class App(tk.Tk):
             ),
             Tooltip(
                 border_clip_radio,
-                "Trims triangles outside the Swiss border geometry.",
+                "Trims triangles outside the selected border geometry.",
             ),
             Tooltip(
                 self.border_shp_label,
