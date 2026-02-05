@@ -1227,7 +1227,68 @@ def _parse_border_scale(raw: str, tiles_dir: Path) -> float:
     return float(value)
 
 
-def _load_border_geometry(shp_path: Path):
+def _parse_border_keep_list(raw: str) -> List[str]:
+    if not raw:
+        return []
+    items = [part.strip() for part in raw.split(",")]
+    return [item for item in items if item]
+
+
+def _guess_border_label_field(field_defs, *, border_hint: str = "") -> Optional[str]:
+    field_names = [name for name, _ftype, _len, _dec in field_defs]
+    string_fields = [name for name, ftype, _len, _dec in field_defs if ftype in {"C", "M"}]
+    upper_names = {name.upper(): name for name in field_names}
+    hint = border_hint.upper()
+
+    if "BEZIRK" in hint:
+        preferred = [
+            "BEZIRKSNAME",
+            "BEZIRK",
+            "NAME",
+            "NAME_DE",
+            "NAME_FR",
+            "NAME_IT",
+            "NAME_EN",
+        ]
+    elif "KANTON" in hint:
+        preferred = [
+            "KANTONSNAME",
+            "KANTON",
+            "NAME",
+            "NAME_DE",
+            "NAME_FR",
+            "NAME_IT",
+            "NAME_EN",
+        ]
+    else:
+        preferred = [
+            "NAME",
+            "NAME_DE",
+            "NAME_FR",
+            "NAME_IT",
+            "NAME_EN",
+        ]
+
+    for candidate in preferred:
+        if candidate in upper_names:
+            return upper_names[candidate]
+
+    for name in field_names:
+        if "NAME" in name.upper():
+            return name
+
+    if string_fields:
+        return string_fields[0]
+
+    return None
+
+
+def _load_border_geometry(
+    shp_path: Path,
+    *,
+    keep_values: Optional[List[str]] = None,
+    keep_field: Optional[str] = None,
+):
     try:
         import shapefile  # pyshp
         from shapely.geometry import shape as shapely_shape
@@ -1242,16 +1303,47 @@ def _load_border_geometry(shp_path: Path):
         raise FileNotFoundError(f"Border shapefile not found: {shp_path}")
 
     reader = shapefile.Reader(str(shp_path))
+    field_defs = [f for f in reader.fields if f[0] != "DeletionFlag"]
+    field_names = [name for name, _ftype, _len, _dec in field_defs]
+
+    keep_set = set(v.strip().lower() for v in (keep_values or []) if v.strip())
+    label_field = None
+    if keep_set:
+        if keep_field:
+            matches = [name for name in field_names if name.upper() == keep_field.strip().upper()]
+            if not matches:
+                raise ValueError(
+                    f"Border field '{keep_field}' not found in {shp_path.name}. "
+                    f"Available fields: {', '.join(field_names)}"
+                )
+            label_field = matches[0]
+        else:
+            label_field = _guess_border_label_field(field_defs, border_hint=shp_path.name)
+        if not label_field:
+            raise ValueError(f"Could not find a name field in {shp_path.name} for --border-keep.")
+
     geoms = []
-    for shp in reader.shapes():
-        geom = shapely_shape(shp.__geo_interface__)
+    for shape_record in reader.iterShapeRecords():
+        geom = shapely_shape(shape_record.shape.__geo_interface__)
         if geom.is_empty:
             continue
         if geom.geom_type not in {"Polygon", "MultiPolygon"}:
             continue
+        if keep_set:
+            record_dict = dict(zip(field_names, shape_record.record))
+            value = record_dict.get(label_field)
+            if value is None:
+                continue
+            if str(value).strip().lower() not in keep_set:
+                continue
         geoms.append(geom)
 
     if not geoms:
+        if keep_set:
+            raise ValueError(
+                f"No polygon geometries matched --border-keep in {shp_path}. "
+                f"Field: {label_field}"
+            )
         raise ValueError(f"No polygon geometries found in {shp_path}")
 
     return unary_union(geoms)
@@ -1519,6 +1611,18 @@ def main() -> None:
         help="Scale factor to apply to border coordinates to match STL units. "
              "Use a number (e.g. 10) or 'auto' to reuse the last conversion scale.",
     )
+    ap.add_argument(
+        "--border-keep",
+        type=str,
+        default="",
+        help="Comma-separated list of border feature names to keep (case-insensitive).",
+    )
+    ap.add_argument(
+        "--border-field",
+        type=str,
+        default="",
+        help="DBF field name to match when using --border-keep (optional).",
+    )
 
     ap.add_argument(
         "--tol",
@@ -1656,7 +1760,15 @@ def main() -> None:
                 ap.error("--clip-border requested but no border shapefile was found in ./borders.")
             border_scale = _parse_border_scale(str(args.border_scale), Path("./output/tiles"))
             print(f"[BORDER] Loading border from {border_path}")
-            border_geom = _load_border_geometry(border_path)
+            keep_values = _parse_border_keep_list(str(args.border_keep))
+            keep_field = str(args.border_field).strip() or None
+            if keep_values:
+                print(f"[BORDER] Keeping {len(keep_values)} feature(s)")
+            border_geom = _load_border_geometry(
+                border_path,
+                keep_values=keep_values or None,
+                keep_field=keep_field,
+            )
             if border_scale != 1.0:
                 print(f"[BORDER] Scaling border by {border_scale:.6f}")
                 border_geom = _scale_border_geometry(border_geom, float(border_scale))

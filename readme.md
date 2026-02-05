@@ -158,8 +158,10 @@ This step merges all tiles in `output/tiles` into a single STL and optionally ad
   - **Base Z (optional)**: Explicit base elevation (overrides thickness).
 - **Border clipping**: Choose whether to merge all tiles or clip to a Swiss border shapefile.
   - **Clip to Swiss border**: Trims triangles outside the selected border geometry.
-  - **Border shapefile**: Pick a `.shp` from `./borders` (LANDESGEBIET is the country outline).
+  - **Border shapefile**: Pick a `.shp` from `./borders` (Landesgrenze is the country outline).
   - **Border scale**: Scale factor for border coordinates. Use `auto` to reuse the tile scale stored in `output/tiles/scale_info.json` (falls back to `1.0`).
+  - **Keep canton/bezirk**: Click **Detect touched** to list only regions intersecting the current tiles, then multi-select which to keep (Ctrl/Shift).
+    - Works with canton/bezirk datasets and requires `pyshp` + `shapely` installed.
 
 ---
 
@@ -200,6 +202,7 @@ python download_tiles.py --csv path/to/urls.csv
 python build_stl.py --all --target-size-mm 150
 python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001 --make-solid
 python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp borders/LANDESGEBIET.shp --border-scale auto
+python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp borders/KANTONSGRENZE.shp --border-keep "Bern,Uri"
 ```
 
 ---

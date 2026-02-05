@@ -1,8 +1,10 @@
+import json
 import shutil
 import subprocess
 import sys
 import threading
 import queue
+import struct
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -101,6 +103,9 @@ class App(tk.Tk):
         self.border_options = self._discover_border_shp()
         default_border_label = self._select_default_border_label()
         self.border_shp_var = tk.StringVar(value=default_border_label)
+        self.border_keep_var = tk.StringVar(value="")
+        self.border_keep_options: list[str] = []
+        self.border_keep_all_label = "(all touched)"
 
         self._setup_theme()
         self._build_ui()
@@ -669,21 +674,44 @@ class App(tk.Tk):
             textvariable=self.border_shp_var,
             values=sorted(self.border_options.keys()),
             state="readonly",
-            width=68,
+            width=30,
         )
         self.border_shp_combo.grid(row=5, column=1, columnspan=3, sticky=tk.EW)
+        self.border_shp_combo.bind("<<ComboboxSelected>>", self._on_border_shp_change)
 
         self.border_scale_label = ttk.Label(frame, text="Border scale:")
         self.border_scale_label.grid(row=5, column=4, sticky=tk.W, pady=2)
         self.border_scale_entry = ttk.Entry(frame, textvariable=self.border_scale_var, width=10)
         self.border_scale_entry.grid(row=5, column=5, sticky=tk.W)
 
+        self.border_keep_label = ttk.Label(frame, text="Keep canton/bezirk:")
+        self.border_keep_label.grid(row=6, column=0, sticky=tk.W, pady=2)
+        self.border_keep_list = tk.Listbox(
+            frame,
+            selectmode=tk.MULTIPLE,
+            height=6,
+            exportselection=False,
+            bg="#0b1220",
+            fg="#e2e8f0",
+            highlightthickness=1,
+            highlightbackground="#1f2937",
+            selectbackground="#2563eb",
+            selectforeground="#f8fafc",
+        )
+        self.border_keep_list.grid(row=6, column=1, columnspan=3, sticky=tk.EW)
+        self.border_keep_refresh_btn = ttk.Button(
+            frame,
+            text="Detect touched",
+            command=self._refresh_border_keep_options,
+        )
+        self.border_keep_refresh_btn.grid(row=6, column=4, padx=4, pady=2, sticky=tk.W)
+
         self.merge_btn = ttk.Button(frame, text="Run Merge", command=self._run_merge)
-        self.merge_btn.grid(row=6, column=5, sticky=tk.E, padx=4, pady=6)
+        self.merge_btn.grid(row=7, column=5, sticky=tk.E, padx=4, pady=6)
         self.status_vars["merge"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["merge"] = ttk.Label(frame, textvariable=self.status_vars["merge"])
         self.status_labels["merge"].grid(
-            row=6, column=3, sticky=tk.W, padx=(12, 0)
+            row=7, column=3, sticky=tk.W, padx=(12, 0)
         )
         self.status_labels["merge"].configure(width=12)
 
@@ -694,9 +722,9 @@ class App(tk.Tk):
             mode="determinate",
             length=220,
         )
-        self.merge_progress.grid(row=7, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.merge_progress.grid(row=8, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.merge_progress_label = ttk.Label(frame, textvariable=self.merge_progress_label_var)
-        self.merge_progress_label.grid(row=7, column=3, columnspan=3, sticky=tk.W, pady=(4, 0))
+        self.merge_progress_label.grid(row=8, column=3, columnspan=3, sticky=tk.W, pady=(4, 0))
         self.merge_progress_label.configure(width=26)
 
         frame.columnconfigure(1, weight=1)
@@ -789,12 +817,30 @@ class App(tk.Tk):
                 "Use 'auto' to reuse the last conversion scale (output/tiles/scale_info.json).",
             ),
             Tooltip(
+                self.border_keep_label,
+                "When clipping by canton or bezirk, choose which touched region to keep.",
+            ),
+            Tooltip(
+                self.border_keep_list,
+                "Select one or more touched regions to keep (Ctrl/Shift to multi-select).",
+            ),
+            Tooltip(
+                self.border_keep_refresh_btn,
+                "Re-scan tile bounds to update the touched canton/bezirk list.",
+            ),
+            Tooltip(
                 self.merge_btn,
                 "Runs build_stl.py --merge-stl with the selected options.",
             ),
         ]
 
         self._update_merge_controls()
+
+    def _format_border_label(self, path: Path) -> str:
+        name = path.stem.replace("_", " ").strip()
+        if not name:
+            return path.name
+        return name.title()
 
     def _discover_border_shp(self) -> dict[str, Path]:
         options: dict[str, Path] = {}
@@ -803,7 +849,9 @@ class App(tk.Tk):
         for shp in sorted(self.borders_dir.rglob("*.shp")):
             if not shp.is_file():
                 continue
-            label = str(shp.relative_to(self.borders_dir))
+            label = self._format_border_label(shp)
+            if label in options:
+                label = f"{label} ({shp.name})"
             options[label] = shp
         return options
 
@@ -812,14 +860,297 @@ class App(tk.Tk):
         if default_raw:
             default_path = Path(default_raw)
             if default_path.exists():
-                try:
-                    return str(default_path.relative_to(self.borders_dir))
-                except ValueError:
-                    return str(default_path)
+                for label, path in self.border_options.items():
+                    if path.resolve() == default_path.resolve():
+                        return label
+                return self._format_border_label(default_path)
         if not self.border_options:
             return ""
-        preferred = [label for label in self.border_options if "LANDESGEBIET" in label.upper()]
+        preferred = [label for label in self.border_options if "LANDES" in label.upper()]
         return sorted(preferred or list(self.border_options.keys()))[0]
+
+    def _border_type_from_path(self, path: Path) -> str | None:
+        name = path.name.upper()
+        if "KANTON" in name:
+            return "canton"
+        if "BEZIRK" in name:
+            return "bezirk"
+        try:
+            import shapefile  # pyshp
+        except Exception:
+            return None
+
+        try:
+            reader = shapefile.Reader(str(path))
+        except Exception:
+            return None
+
+        field_defs = [f for f in reader.fields if f[0] != "DeletionFlag"]
+        field_names = {name.upper() for name, _ftype, _len, _dec in field_defs}
+        if {"KANTONSNAME", "KANTON"} & field_names:
+            return "canton"
+        if {"BEZIRKSNAME", "BEZIRK"} & field_names:
+            return "bezirk"
+        return None
+
+    def _read_last_scale_info(self) -> float | None:
+        scale_info = self.tiles_dir / "scale_info.json"
+        if not scale_info.exists():
+            return None
+        try:
+            data = json.loads(scale_info.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        try:
+            return float(data.get("scale_xy"))
+        except (TypeError, ValueError):
+            return None
+
+    def _parse_scale_ratio(self, raw: str) -> float:
+        s = raw.strip()
+        if not s:
+            raise ValueError("Scale ratio is empty.")
+        if ":" in s:
+            parts = s.split(":")
+        elif "/" in s:
+            parts = s.split("/")
+        else:
+            parts = [s]
+        if len(parts) == 1:
+            ratio = float(parts[0])
+        elif len(parts) == 2:
+            a = float(parts[0])
+            b = float(parts[1])
+            if a == 0:
+                raise ValueError("Scale ratio numerator cannot be zero.")
+            ratio = b / a
+        else:
+            raise ValueError("Invalid scale ratio format.")
+        if ratio <= 0:
+            raise ValueError("Scale ratio must be > 0.")
+        return ratio
+
+    def _parse_border_scale(self, raw: str) -> float:
+        value = raw.strip().lower()
+        if value in {"", "auto"}:
+            scale = self._read_last_scale_info()
+            if scale is None:
+                return 1.0
+            return float(scale)
+        if ":" in value or "/" in value:
+            ratio = self._parse_scale_ratio(value)
+            return 1000.0 / float(ratio)
+        return float(value)
+
+    def _iter_stl_vertices(self, path: Path):
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            return
+        try:
+            with path.open("rb") as handle:
+                header = handle.read(80)
+                count_bytes = handle.read(4)
+                if len(count_bytes) == 4:
+                    tri_count = struct.unpack("<I", count_bytes)[0]
+                    expected = 84 + tri_count * 50
+                    if file_size == expected:
+                        for _ in range(tri_count):
+                            data = handle.read(50)
+                            if len(data) < 50:
+                                break
+                            vals = struct.unpack("<12f", data[:48])
+                            yield (vals[3], vals[4], vals[5])
+                            yield (vals[6], vals[7], vals[8])
+                            yield (vals[9], vals[10], vals[11])
+                        return
+        except OSError:
+            return
+
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore") as handle:
+                for line in handle:
+                    s = line.strip()
+                    if s.lower().startswith("vertex"):
+                        parts = s.split()
+                        if len(parts) >= 4:
+                            try:
+                                yield (float(parts[1]), float(parts[2]), float(parts[3]))
+                            except ValueError:
+                                continue
+        except OSError:
+            return
+
+    def _stl_bounds(self, path: Path) -> tuple[float, float, float, float] | None:
+        min_x = min_y = float("inf")
+        max_x = max_y = float("-inf")
+        found = False
+        for x, y, _z in self._iter_stl_vertices(path):
+            found = True
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+        if not found:
+            return None
+        return min_x, min_y, max_x, max_y
+
+    def _collect_tile_union(self):
+        try:
+            from shapely.geometry import box
+            from shapely.ops import unary_union
+        except Exception as exc:
+            raise RuntimeError(
+                "Border selection requires 'shapely'. Install with: pip install shapely"
+            ) from exc
+
+        stl_files = sorted(self.tiles_dir.glob("*.stl"))
+        if not stl_files:
+            return None
+        boxes = []
+        for path in stl_files:
+            bounds = self._stl_bounds(path)
+            if bounds is None:
+                continue
+            min_x, min_y, max_x, max_y = bounds
+            boxes.append(box(min_x, min_y, max_x, max_y))
+        if not boxes:
+            return None
+        return unary_union(boxes)
+
+    def _guess_border_label_field(self, field_defs, border_type: str) -> str | None:
+        field_names = [name for name, _ftype, _len, _dec in field_defs]
+        string_fields = [name for name, ftype, _len, _dec in field_defs if ftype in {"C", "M"}]
+        upper_names = {name.upper(): name for name in field_names}
+
+        if border_type == "bezirk":
+            preferred = [
+                "BEZIRKSNAME",
+                "BEZIRK",
+                "NAME",
+                "NAME_DE",
+                "NAME_FR",
+                "NAME_IT",
+                "NAME_EN",
+            ]
+        elif border_type == "canton":
+            preferred = [
+                "KANTONSNAME",
+                "KANTON",
+                "NAME",
+                "NAME_DE",
+                "NAME_FR",
+                "NAME_IT",
+                "NAME_EN",
+            ]
+        else:
+            preferred = [
+                "NAME",
+                "NAME_DE",
+                "NAME_FR",
+                "NAME_IT",
+                "NAME_EN",
+            ]
+
+        for candidate in preferred:
+            if candidate in upper_names:
+                return upper_names[candidate]
+
+        for name in field_names:
+            if "NAME" in name.upper():
+                return name
+
+        if string_fields:
+            return string_fields[0]
+
+        return None
+
+    def _load_border_features(self, shp_path: Path, border_scale: float, border_type: str):
+        try:
+            import shapefile  # pyshp
+            from shapely.geometry import shape as shapely_shape
+            from shapely.affinity import scale as shapely_scale
+        except Exception as exc:
+            raise RuntimeError(
+                "Border selection requires 'pyshp' and 'shapely'. Install with: pip install pyshp shapely"
+            ) from exc
+
+        reader = shapefile.Reader(str(shp_path))
+        field_defs = [f for f in reader.fields if f[0] != "DeletionFlag"]
+        field_names = [name for name, _ftype, _len, _dec in field_defs]
+        label_field = self._guess_border_label_field(field_defs, border_type)
+        if not label_field:
+            raise RuntimeError(f"Could not find a label field in {shp_path.name}.")
+
+        features = []
+        for shape_record in reader.iterShapeRecords():
+            geom = shapely_shape(shape_record.shape.__geo_interface__)
+            if geom.is_empty or geom.geom_type not in {"Polygon", "MultiPolygon"}:
+                continue
+            if border_scale != 1.0:
+                geom = shapely_scale(geom, xfact=border_scale, yfact=border_scale, origin=(0.0, 0.0))
+            record_dict = dict(zip(field_names, shape_record.record))
+            value = record_dict.get(label_field, "")
+            label = str(value).strip() if value is not None else ""
+            if not label:
+                continue
+            features.append((label, geom))
+        return features
+
+    def _refresh_border_keep_options(self) -> None:
+        if self.merge_border_mode_var.get() != "clip":
+            return
+        border_label = self.border_shp_var.get().strip()
+        if not border_label:
+            return
+        border_path = self.border_options.get(border_label, Path(border_label))
+        border_type = self._border_type_from_path(border_path)
+        if border_type not in {"canton", "bezirk"}:
+            self.border_keep_options = []
+            self.border_keep_var.set("")
+            self.border_keep_list.delete(0, tk.END)
+            return
+
+        try:
+            tile_union = self._collect_tile_union()
+        except Exception as exc:
+            messagebox.showerror("Missing dependency", str(exc))
+            return
+
+        if tile_union is None:
+            messagebox.showwarning(
+                "No tiles found",
+                "No STL tiles were found in output/tiles. Convert tiles first.",
+            )
+            return
+
+        try:
+            border_scale = self._parse_border_scale(self.border_scale_var.get())
+            features = self._load_border_features(border_path, border_scale, border_type)
+        except Exception as exc:
+            messagebox.showerror("Border selection failed", str(exc))
+            return
+
+        touched = sorted({name for name, geom in features if geom.intersects(tile_union)})
+        if not touched:
+            messagebox.showwarning(
+                "No touched regions",
+                "No cantons/bezirk regions intersect the current tiles.",
+            )
+            self.border_keep_options = []
+            self.border_keep_var.set("")
+            self.border_keep_list.delete(0, tk.END)
+            return
+
+        self.border_keep_options = [self.border_keep_all_label] + touched
+        self.border_keep_list.delete(0, tk.END)
+        for item in self.border_keep_options:
+            self.border_keep_list.insert(tk.END, item)
+        self.border_keep_list.selection_set(0)
+
+    def _on_border_shp_change(self, _event: tk.Event) -> None:
+        self._refresh_border_keep_options()
+        self._update_merge_controls()
 
     def _browse_csv(self) -> None:
         path = filedialog.askopenfilename(
@@ -998,6 +1329,14 @@ class App(tk.Tk):
             border_scale = self.border_scale_var.get().strip()
             if border_scale:
                 args += ["--border-scale", border_scale]
+            if border_label:
+                border_path = self.border_options.get(border_label, Path(border_label))
+                border_type = self._border_type_from_path(border_path)
+                if border_type in {"canton", "bezirk"}:
+                    selections = [self.border_keep_list.get(i) for i in self.border_keep_list.curselection()]
+                    selections = [s for s in selections if s and s != self.border_keep_all_label]
+                    if selections:
+                        args += ["--border-keep", ",".join(selections)]
 
         model_name = self.model_name_var.get().strip()
         if model_name:
@@ -1135,6 +1474,13 @@ class App(tk.Tk):
         border_mode = self.merge_border_mode_var.get()
         border_available = bool(self.border_options)
         clip_border = border_mode == "clip" and border_available
+        border_path = None
+        if border_available:
+            border_label = self.border_shp_var.get().strip()
+            if border_label:
+                border_path = self.border_options.get(border_label, Path(border_label))
+        border_type = self._border_type_from_path(border_path) if border_path else None
+        border_keep_enabled = border_available and border_type in {"canton", "bezirk"}
 
         if make_solid:
             self.base_mode_combo.configure(state="readonly")
@@ -1159,10 +1505,18 @@ class App(tk.Tk):
             self.merge_border_mode_var.set("all")
             clip_border = False
 
-        self.border_shp_combo.configure(state="readonly" if border_available else "disabled")
+        self.border_shp_combo.configure(state="readonly" if clip_border else "disabled")
         self.border_scale_entry.configure(state="normal" if clip_border else "disabled")
-        self.border_shp_label.configure(foreground="#e2e8f0" if border_available else "#6b7280")
+        self.border_shp_label.configure(foreground="#e2e8f0" if clip_border else "#6b7280")
         self.border_scale_label.configure(foreground="#e2e8f0" if clip_border else "#6b7280")
+        self.border_keep_list.configure(state="normal" if border_keep_enabled else "disabled")
+        self.border_keep_refresh_btn.configure(state="normal" if border_keep_enabled else "disabled")
+        self.border_keep_label.configure(foreground="#e2e8f0" if border_keep_enabled else "#6b7280")
+        if not border_keep_enabled:
+            self.border_keep_var.set("")
+            self.border_keep_list.delete(0, tk.END)
+        elif not self.border_keep_options:
+            self._refresh_border_keep_options()
 
     def _set_status(self, key: str, text: str, color: str) -> None:
         var = self.status_vars.get(key)
