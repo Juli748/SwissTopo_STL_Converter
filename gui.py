@@ -716,6 +716,7 @@ class App(tk.Tk):
         self.border_keep_list.bind("<MouseWheel>", self._on_listbox_mousewheel)
         self.border_keep_list.bind("<Button-4>", self._on_listbox_mousewheel)
         self.border_keep_list.bind("<Button-5>", self._on_listbox_mousewheel)
+        self.border_keep_list.bind("<<ListboxSelect>>", self._on_border_keep_select)
         self.border_keep_refresh_btn = ttk.Button(
             frame,
             text="Detect touched",
@@ -1168,6 +1169,21 @@ class App(tk.Tk):
     def _on_border_shp_change(self, _event: tk.Event) -> None:
         self._refresh_border_keep_options()
         self._update_merge_controls()
+
+    def _on_border_keep_select(self, _event: tk.Event) -> None:
+        selections = list(self.border_keep_list.curselection())
+        if not selections:
+            return
+        labels = [self.border_keep_list.get(i) for i in selections]
+        if self.border_keep_all_label in labels and len(labels) > 1:
+            all_index = self.border_keep_options.index(self.border_keep_all_label)
+            active_index = self.border_keep_list.index(tk.ACTIVE)
+            if active_index == all_index:
+                for idx in selections:
+                    if idx != all_index:
+                        self.border_keep_list.selection_clear(idx)
+            else:
+                self.border_keep_list.selection_clear(all_index)
 
     def _browse_csv(self) -> None:
         path = filedialog.askopenfilename(
