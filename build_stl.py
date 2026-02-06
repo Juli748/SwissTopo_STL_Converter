@@ -880,6 +880,559 @@ def scale_mesh_z(mesh: Mesh, z_scale: float) -> Mesh:
 
 
 # ----------------------------
+# Buildings (GDB -> STL)
+# ----------------------------
+
+def _load_scale_info(tiles_dir: Path) -> Tuple[float, float]:
+    scale_info_path = tiles_dir / "scale_info.json"
+    if not scale_info_path.exists():
+        return 1.0, 1.0
+    try:
+        info = json.loads(scale_info_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print(f"[WARN] Failed to read {scale_info_path}; using scale 1.0")
+        return 1.0, 1.0
+    scale_xy = float(info.get("scale_xy", 1.0))
+    z_scale = float(info.get("z_scale", 1.0))
+    return scale_xy, z_scale
+
+
+def _unzip_gdb(zip_path: Path, buildings_dir: Path) -> Optional[Path]:
+    try:
+        import zipfile
+    except Exception:
+        return None
+    target_dir = buildings_dir / zip_path.stem
+    if target_dir.exists():
+        return target_dir
+    print(f"[BUILDINGS] Unzip {zip_path.name} -> {buildings_dir}")
+    with zipfile.ZipFile(zip_path, "r") as zip_ref:
+        zip_ref.extractall(buildings_dir)
+    if target_dir.exists():
+        return target_dir
+    candidates = list(buildings_dir.glob("*.gdb"))
+    return candidates[0] if candidates else None
+
+
+def _find_building_sources(buildings_dir: Path) -> List[Path]:
+    sources = []
+    if not buildings_dir.exists():
+        return sources
+    sources.extend(sorted([p for p in buildings_dir.glob("*.gdb") if p.is_dir()]))
+    for zip_path in sorted(buildings_dir.glob("*.gdb.zip")):
+        extracted = _unzip_gdb(zip_path, buildings_dir)
+        if extracted is not None and extracted not in sources:
+            sources.append(extracted)
+    return sources
+
+
+def _get_float_prop(props: Dict[str, object], keys: Tuple[str, ...]) -> Optional[float]:
+    if not props:
+        return None
+    lower = {str(k).lower(): v for k, v in props.items()}
+    for key in keys:
+        if key in lower and lower[key] is not None:
+            try:
+                return float(lower[key])
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def _geom_z_bounds(geom) -> Tuple[Optional[float], Optional[float]]:
+    if geom is None:
+        return None, None
+    try:
+        mapping = geom.__geo_interface__
+    except AttributeError:
+        return None, None
+    coords = mapping.get("coordinates")
+    if coords is None:
+        return None, None
+    z_min = None
+    z_max = None
+
+    def walk(item) -> None:
+        nonlocal z_min, z_max
+        if not item:
+            return
+        if isinstance(item[0], (float, int)):
+            if len(item) >= 3:
+                z = float(item[2])
+                z_min = z if z_min is None else min(z_min, z)
+                z_max = z if z_max is None else max(z_max, z)
+            return
+        for sub in item:
+            walk(sub)
+
+    walk(coords)
+    return z_min, z_max
+
+
+def _derive_building_heights(
+    props: Dict[str, object],
+    geom,
+    *,
+    default_height: float,
+    min_height: float,
+    max_height: Optional[float],
+) -> Tuple[float, float]:
+    height_keys = (
+        "height",
+        "height_m",
+        "hgt",
+        "h",
+        "hoehe",
+        "buildingheight",
+        "height_roof",
+        "roof_height",
+        "h_tot",
+        "h_total",
+    )
+    zmin_keys = (
+        "z_min",
+        "zmin",
+        "base_z",
+        "ground_z",
+        "z_base",
+        "alt_min",
+        "elevation_min",
+    )
+    zmax_keys = (
+        "z_max",
+        "zmax",
+        "roof_z",
+        "z_roof",
+        "alt_max",
+        "elevation_max",
+    )
+    base_keys = (
+        "base",
+        "ground",
+        "ground_z",
+        "elevation",
+        "altitude",
+        "alt",
+    )
+
+    height = _get_float_prop(props, height_keys)
+    z_min = _get_float_prop(props, zmin_keys)
+    z_max = _get_float_prop(props, zmax_keys)
+    base = _get_float_prop(props, base_keys)
+    geom_z_min, geom_z_max = _geom_z_bounds(geom)
+
+    base_z = None
+    top_z = None
+    if z_min is not None and z_max is not None and z_max > z_min:
+        base_z = z_min
+        top_z = z_max
+    elif height is not None:
+        base_z = base if base is not None else (z_min if z_min is not None else 0.0)
+        top_z = base_z + height
+    elif geom_z_min is not None and geom_z_max is not None and geom_z_max > geom_z_min:
+        base_z = geom_z_min
+        top_z = geom_z_max
+    elif z_max is not None and base is not None:
+        base_z = base
+        top_z = z_max
+
+    if base_z is None or top_z is None or top_z <= base_z:
+        base_z = 0.0
+        top_z = float(default_height)
+
+    height = max(float(min_height), float(top_z - base_z))
+    if max_height is not None:
+        height = min(height, float(max_height))
+    top_z = base_z + height
+    return float(base_z), float(top_z)
+
+
+def _ring_coords_without_close(coords: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    if len(coords) >= 2 and coords[0] == coords[-1]:
+        return coords[:-1]
+    return coords
+
+
+def _fan_triangulate(coords: List[Tuple[float, float]]) -> List[Tuple[Tuple[float, float], Tuple[float, float], Tuple[float, float]]]:
+    coords = _ring_coords_without_close(coords)
+    if len(coords) < 3:
+        return []
+    tris = []
+    origin = coords[0]
+    for i in range(1, len(coords) - 1):
+        tris.append((origin, coords[i], coords[i + 1]))
+    return tris
+
+
+def _is_convex_polygon(polygon) -> bool:
+    if polygon.is_empty or polygon.area <= 0.0:
+        return False
+    if polygon.interiors:
+        return False
+    hull = polygon.convex_hull
+    if hull.is_empty:
+        return False
+    area = float(polygon.area)
+    delta = abs(float(hull.area) - area)
+    return delta <= max(1e-9, area * 1e-6)
+
+
+def _polygon_to_mesh(
+    polygon,
+    base_z: float,
+    top_z: float,
+    *,
+    scale_xy: float,
+    z_scale: float,
+    vertices: List[Tuple[float, float, float]],
+    faces: List[Tuple[int, int, int]],
+) -> None:
+    def add_tri(a, b, c) -> None:
+        i0 = len(vertices)
+        vertices.append(a)
+        vertices.append(b)
+        vertices.append(c)
+        faces.append((i0, i0 + 1, i0 + 2))
+
+    z_top = top_z * scale_xy * z_scale
+    z_base = base_z * scale_xy * z_scale
+
+    use_fan = False
+    if not polygon.interiors:
+        exterior_coords = list(polygon.exterior.coords)
+        if len(_ring_coords_without_close(exterior_coords)) <= 4 or _is_convex_polygon(polygon):
+            use_fan = True
+
+    if use_fan:
+        for a2d, b2d, c2d in _fan_triangulate(list(polygon.exterior.coords)):
+            top = [
+                (a2d[0] * scale_xy, a2d[1] * scale_xy, z_top),
+                (b2d[0] * scale_xy, b2d[1] * scale_xy, z_top),
+                (c2d[0] * scale_xy, c2d[1] * scale_xy, z_top),
+            ]
+            bot = [
+                (a2d[0] * scale_xy, a2d[1] * scale_xy, z_base),
+                (b2d[0] * scale_xy, b2d[1] * scale_xy, z_base),
+                (c2d[0] * scale_xy, c2d[1] * scale_xy, z_base),
+            ]
+            add_tri(top[0], top[1], top[2])
+            add_tri(bot[0], bot[2], bot[1])
+    else:
+        try:
+            from shapely.ops import triangulate
+        except Exception as exc:
+            raise RuntimeError(
+                "Building triangulation requires shapely. Install with: pip install shapely"
+            ) from exc
+        tris = triangulate(polygon)
+        for tri in tris:
+            if not polygon.covers(tri):
+                continue
+            coords = list(tri.exterior.coords)
+            if len(coords) < 3:
+                continue
+            coords = coords[:3]
+            top = [(c[0] * scale_xy, c[1] * scale_xy, z_top) for c in coords]
+            bot = [(c[0] * scale_xy, c[1] * scale_xy, z_base) for c in coords]
+            add_tri(top[0], top[1], top[2])
+            add_tri(bot[0], bot[2], bot[1])
+
+    def add_ring_walls(ring_coords) -> None:
+        coords = list(ring_coords)
+        if len(coords) < 2:
+            return
+        for a, b in zip(coords, coords[1:]):
+            ax, ay = a[0] * scale_xy, a[1] * scale_xy
+            bx, by = b[0] * scale_xy, b[1] * scale_xy
+            az0 = z_base
+            az1 = z_top
+            a0 = (ax, ay, az0)
+            a1 = (ax, ay, az1)
+            b0 = (bx, by, az0)
+            b1 = (bx, by, az1)
+            add_tri(a0, b0, b1)
+            add_tri(a0, b1, a1)
+
+    add_ring_walls(polygon.exterior.coords)
+    for interior in polygon.interiors:
+        add_ring_walls(interior.coords)
+
+
+def _process_building_layer(
+    gdb_path: str,
+    layer: str,
+    terrain_bbox: Optional[Tuple[float, float, float, float]],
+    scale_xy: float,
+    z_scale: float,
+    default_height: float,
+    min_height: float,
+    max_height: Optional[float],
+) -> Tuple[List[Tuple[float, float, float]], List[Tuple[int, int, int]], int, int]:
+    import fiona
+    from shapely.geometry import shape
+
+    open_kwargs = {"layer": layer}
+    if terrain_bbox is not None:
+        open_kwargs["bbox"] = terrain_bbox
+    with fiona.open(gdb_path, **open_kwargs) as src:
+        geom_type = str(src.schema.get("geometry", "")).lower()
+        if geom_type and "polygon" not in geom_type:
+            print(f"[BUILDINGS] Skipping layer {layer} (geometry={src.schema.get('geometry')})")
+            return [], [], 0, 0
+        vertices: List[Tuple[float, float, float]] = []
+        faces: List[Tuple[int, int, int]] = []
+        seen = 0
+        kept = 0
+        for feat in src:
+            seen += 1
+            geom_raw = feat.get("geometry")
+            if not geom_raw:
+                continue
+            geom = shape(geom_raw)
+            if geom.is_empty:
+                continue
+            if geom.geom_type == "Polygon":
+                polys = [geom]
+            elif geom.geom_type == "MultiPolygon":
+                polys = list(geom.geoms)
+            else:
+                continue
+
+            base_z, top_z = _derive_building_heights(
+                feat.get("properties", {}) or {},
+                geom,
+                default_height=default_height,
+                min_height=min_height,
+                max_height=max_height,
+            )
+            for poly in polys:
+                _polygon_to_mesh(
+                    poly,
+                    base_z,
+                    top_z,
+                    scale_xy=scale_xy,
+                    z_scale=z_scale,
+                    vertices=vertices,
+                    faces=faces,
+                )
+                kept += 1
+    return vertices, faces, seen, kept
+
+
+def _pick_building_layer(gdb_path: Path, layers: List[str], preferred: Optional[str] = None) -> Optional[str]:
+    try:
+        import fiona
+    except Exception:
+        return None
+    if preferred and preferred.lower() != "auto":
+        return preferred
+    # Prefer roof layer if present
+    for name in layers:
+        lname = name.lower()
+        if "roof" in lname:
+            return name
+    for name in layers:
+        lname = name.lower()
+        if "building" in lname or "geb" in lname:
+            return name
+    # Otherwise, first polygon layer
+    for name in layers:
+        try:
+            with fiona.open(gdb_path, layer=name) as src:
+                geom_type = str(src.schema.get("geometry", "")).lower()
+                if "polygon" in geom_type:
+                    return name
+        except Exception:
+            continue
+    return layers[0] if layers else None
+
+
+def _chunk_features(features: List[Tuple[dict, dict]], workers: int) -> List[List[Tuple[dict, dict]]]:
+    if not features:
+        return []
+    if workers <= 1:
+        return [features]
+    chunk_count = max(1, workers * 4)
+    chunk_size = max(1, len(features) // chunk_count)
+    chunks: List[List[Tuple[dict, dict]]] = []
+    for i in range(0, len(features), chunk_size):
+        chunks.append(features[i:i + chunk_size])
+    return chunks
+
+
+def _process_building_chunk(
+    chunk: List[Tuple[dict, dict]],
+    scale_xy: float,
+    z_scale: float,
+    default_height: float,
+    min_height: float,
+    max_height: Optional[float],
+) -> Tuple[List[Tuple[float, float, float]], List[Tuple[int, int, int]], int, int]:
+    from shapely.geometry import shape
+
+    vertices: List[Tuple[float, float, float]] = []
+    faces: List[Tuple[int, int, int]] = []
+    seen = 0
+    kept = 0
+    for geom_raw, props in chunk:
+        seen += 1
+        if not geom_raw:
+            continue
+        geom = shape(geom_raw)
+        if geom.is_empty:
+            continue
+        if geom.geom_type == "Polygon":
+            polys = [geom]
+        elif geom.geom_type == "MultiPolygon":
+            polys = list(geom.geoms)
+        else:
+            continue
+
+        base_z, top_z = _derive_building_heights(
+            props or {},
+            geom,
+            default_height=default_height,
+            min_height=min_height,
+            max_height=max_height,
+        )
+        for poly in polys:
+            _polygon_to_mesh(
+                poly,
+                base_z,
+                top_z,
+                scale_xy=scale_xy,
+                z_scale=z_scale,
+                vertices=vertices,
+                faces=faces,
+            )
+            kept += 1
+    return vertices, faces, seen, kept
+
+
+def convert_buildings(
+    buildings_dir: Path,
+    output_dir: Path,
+    *,
+    scale_xy: float,
+    z_scale: float,
+    default_height: float,
+    min_height: float,
+    max_height: Optional[float],
+    terrain_bbox: Optional[Tuple[float, float, float, float]],
+    workers: int = 1,
+    layer_name: Optional[str] = None,
+    out_name: Optional[str] = None,
+) -> None:
+    try:
+        import fiona
+        from shapely.geometry import shape
+    except Exception as exc:
+        raise RuntimeError(
+            "Building conversion requires fiona + shapely. Install with: pip install fiona shapely"
+        ) from exc
+
+    sources = _find_building_sources(buildings_dir)
+    if not sources:
+        raise SystemExit("No building GDB sources found in ./data/buildings.")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total = len(sources)
+    for idx, gdb_path in enumerate(sources, 1):
+        print("\n" + "=" * 80)
+        print(f"[BUILDINGS] ({idx}/{total}) Reading {gdb_path.name}")
+        print("=" * 80)
+        layers = fiona.listlayers(gdb_path)
+        if not layers:
+            print(f"[BUILDINGS] No layers found in {gdb_path}")
+            continue
+        chosen_layer = _pick_building_layer(gdb_path, layers, preferred=layer_name)
+        if not chosen_layer:
+            print(f"[BUILDINGS] No polygon layer found in {gdb_path}")
+            continue
+        print(f"[BUILDINGS] Using layer: {chosen_layer}")
+
+        open_kwargs = {"layer": chosen_layer}
+        if terrain_bbox is not None:
+            open_kwargs["bbox"] = terrain_bbox
+        with fiona.open(gdb_path, **open_kwargs) as src:
+            geom_type = str(src.schema.get("geometry", "")).lower()
+            if geom_type and "polygon" not in geom_type:
+                print(f"[BUILDINGS] Skipping layer {chosen_layer} (geometry={src.schema.get('geometry')})")
+                continue
+            features: List[Tuple[dict, dict]] = []
+            for feat in src:
+                geom_raw = feat.get("geometry")
+                if not geom_raw:
+                    continue
+                features.append((geom_raw, feat.get("properties", {}) or {}))
+
+        if not features:
+            print(f"[BUILDINGS] No polygon features in {gdb_path.name}")
+            continue
+
+        max_workers = max(1, int(workers))
+        chunks = _chunk_features(features, max_workers)
+        vertices: List[Tuple[float, float, float]] = []
+        faces: List[Tuple[int, int, int]] = []
+        seen = 0
+        kept = 0
+
+        if max_workers > 1 and len(chunks) > 1:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(
+                        _process_building_chunk,
+                        chunk,
+                        scale_xy,
+                        z_scale,
+                        default_height,
+                        min_height,
+                        max_height,
+                    ): i
+                    for i, chunk in enumerate(chunks)
+                }
+                for future in as_completed(future_map):
+                    try:
+                        chunk_vertices, chunk_faces, chunk_seen, chunk_kept = future.result()
+                    except Exception as exc:
+                        print(f"[BUILDINGS] Chunk failed: {exc}")
+                        continue
+                    if chunk_faces:
+                        offset = len(vertices)
+                        vertices.extend(chunk_vertices)
+                        faces.extend([(a + offset, b + offset, c + offset) for a, b, c in chunk_faces])
+                    seen += chunk_seen
+                    kept += chunk_kept
+        else:
+            chunk_vertices, chunk_faces, chunk_seen, chunk_kept = _process_building_chunk(
+                chunks[0],
+                scale_xy,
+                z_scale,
+                default_height,
+                min_height,
+                max_height,
+            )
+            vertices.extend(chunk_vertices)
+            faces.extend(chunk_faces)
+            seen += chunk_seen
+            kept += chunk_kept
+
+        if not faces:
+            print(f"[BUILDINGS] No building triangles generated for {gdb_path.name}")
+            continue
+
+        mesh = Mesh(
+            vertices=np.asarray(vertices, dtype=np.float64),
+            faces=np.asarray(faces, dtype=np.int64),
+        )
+        out_name = out_name or f"{gdb_path.stem}_buildings.stl"
+        out_path = output_dir / out_name
+        write_binary_stl(mesh, out_path, solid_name=gdb_path.stem)
+        print(f"[BUILDINGS] Wrote {out_path} ({mesh.faces.shape[0]:,} triangles)")
+        print(f"[PROGRESS] {idx}/{total} {gdb_path.name}")
+
+
+# ----------------------------
 # Conversion helpers
 # ----------------------------
 
@@ -982,13 +1535,13 @@ def _convert_worker(
 
 
 def _list_input_files() -> List[Path]:
-    xyz_folder = Path("./data/xyz")
-    tif_folder = Path("./data/tif")
+    xyz_folder = Path("./data/terrain/xyz")
+    tif_folder = Path("./data/terrain/tif")
     xyz_files = sorted(xyz_folder.rglob("*.xyz")) if xyz_folder.exists() else []
     tif_files = []
     if tif_folder.exists():
         tif_files = sorted(tif_folder.rglob("*.tif")) + sorted(tif_folder.rglob("*.tiff"))
-    root_tifs = sorted(Path("./data").glob("*.tif")) + sorted(Path("./data").glob("*.tiff"))
+    root_tifs = sorted(Path("./data/terrain").glob("*.tif")) + sorted(Path("./data/terrain").glob("*.tiff"))
     input_files = []
     for path in tif_files + root_tifs:
         if path not in input_files:
@@ -1003,26 +1556,43 @@ def _list_input_files() -> List[Path]:
     input_files = xyz_files + input_files
     if not input_files:
         raise SystemExit(
-            "No .xyz or .tif files found in ./data/xyz, ./data/tif, or ./data."
+            "No .xyz or .tif files found in ./data/terrain/xyz, ./data/terrain/tif, or ./data/terrain."
         )
     return input_files
 
 
-def _list_stl_files() -> List[Path]:
-    folder = Path("./output/tiles")
+def _list_stl_files(folder: Path, *, allow_empty: bool = False) -> List[Path]:
     if not folder.exists():
+        if allow_empty:
+            return []
         raise SystemExit(f"Folder not found: {folder.resolve()}")
     stl_files = sorted(folder.rglob("*.stl"))
-    if not stl_files:
+    if not stl_files and not allow_empty:
         raise SystemExit(f"No .stl files found in: {folder.resolve()}")
     return stl_files
+
+
+def _collect_merge_stl_files(include_buildings: bool) -> List[Path]:
+    terrain_files = _list_stl_files(Path("./output/tiles"))
+    building_files: List[Path] = []
+    if include_buildings:
+        building_files = _list_stl_files(Path("./output/buildings"), allow_empty=True)
+        if not building_files:
+            print("[WARN] --include-buildings was set but no building STL files were found.")
+    return terrain_files + building_files
 
 
 # ----------------------------
 # STL merge modes
 # ----------------------------
 
-def merge_stls_streaming(out_stl: Path, *, binary_out: bool, solid_name: str = "terrain_merged") -> None:
+def merge_stls_streaming(
+    out_stl: Path,
+    *,
+    binary_out: bool,
+    solid_name: str = "terrain_merged",
+    include_buildings: bool = False,
+) -> None:
     """
     Fast merge that simply concatenates triangles.
     Does not load the whole mesh. Cannot do global solidification.
@@ -1456,6 +2026,7 @@ def merge_stls_mesh(
     base_z_value: Optional[float],
     base_mode: str,
     z_scale: float,
+    include_buildings: bool = False,
     clip_border: bool = False,
     border_geom=None,
 ) -> None:
@@ -1463,8 +2034,8 @@ def merge_stls_mesh(
     Full merge that streams tiles, welds vertices on the fly, and can solidify globally.
     This avoids holding all tile meshes in memory at once.
     """
-    stl_files = _list_stl_files()
-    print(f"Found {len(stl_files)} STL file(s) under ./output/tiles")
+    stl_files = _collect_merge_stl_files(include_buildings)
+    print(f"Found {len(stl_files)} STL file(s) under ./output/tiles" + (" + ./output/buildings" if include_buildings else ""))
     print(f"[MERGE-MESH] Output: {out_stl}")
 
     use_weld = float(weld_tol) > 0.0
@@ -1585,7 +2156,7 @@ def main() -> None:
     ap.add_argument(
         "--all",
         action="store_true",
-        help="Convert all .xyz (./data/xyz) and .tif/.tiff (./data/tif) into ./output/tiles.",
+        help="Convert all .xyz (./data/terrain/xyz) and .tif/.tiff (./data/terrain/tif) into ./output/tiles.",
     )
     ap.add_argument(
         "--merge-stl",
@@ -1711,6 +2282,59 @@ def main() -> None:
         help="Base depth mode for --make-solid when --base-z is not set. "
              "'fixed' uses --base-thickness; 'sealevel' uses Z=0.",
     )
+    ap.add_argument(
+        "--buildings",
+        action="store_true",
+        help="Convert building GDBs from ./data/buildings into ./output/buildings.",
+    )
+    ap.add_argument(
+        "--buildings-dir",
+        type=Path,
+        default=Path("./data/buildings"),
+        help="Folder containing building GDB(s) or GDB ZIP(s).",
+    )
+    ap.add_argument(
+        "--buildings-out",
+        type=Path,
+        default=Path("./output/buildings"),
+        help="Output folder for building STL files.",
+    )
+    ap.add_argument(
+        "--buildings-default-height",
+        type=float,
+        default=10.0,
+        help="Fallback height (in input units, meters) if no building height is provided.",
+    )
+    ap.add_argument(
+        "--buildings-workers",
+        type=int,
+        default=1,
+        help="Parallel workers for building conversion (default: 1).",
+    )
+    ap.add_argument(
+        "--buildings-layer",
+        type=str,
+        default="auto",
+        help="Building layer name to use (default: auto picks Roof/Building/first polygon).",
+    )
+    ap.add_argument(
+        "--buildings-out-name",
+        type=str,
+        default="",
+        help="Optional STL filename for building output (defaults to <gdb>_buildings.stl).",
+    )
+    ap.add_argument(
+        "--buildings-min-height",
+        type=float,
+        default=2.0,
+        help="Minimum building height (in input units, meters).",
+    )
+    ap.add_argument(
+        "--buildings-max-height",
+        type=float,
+        default=None,
+        help="Optional maximum building height (in input units, meters).",
+    )
 
     ap.add_argument(
         "--weld-tol",
@@ -1718,6 +2342,11 @@ def main() -> None:
         default=0.001,
         help="Vertex weld tolerance used for merge/solidify (default: 0.001). "
              "Use something like 0.001 or 0.01 to remove tile seams.",
+    )
+    ap.add_argument(
+        "--include-buildings",
+        action="store_true",
+        help="Include STL files under ./output/buildings when merging terrain.",
     )
     ap.add_argument(
         "--model-name",
@@ -1752,6 +2381,9 @@ def main() -> None:
     if scale_mode_count > 1:
         ap.error("Use only one of --target-size-mm, --tile-size-mm, or --scale-ratio.")
 
+    did_any = False
+    terrain_scale = None
+
     if args.merge_stl is not None:
         border_geom = None
         if args.clip_border:
@@ -1773,6 +2405,25 @@ def main() -> None:
                 print(f"[BORDER] Scaling border by {border_scale:.6f}")
                 border_geom = _scale_border_geometry(border_geom, float(border_scale))
 
+        if bool(args.include_buildings):
+            building_files = _list_stl_files(Path("./output/buildings"), allow_empty=True)
+            if not building_files and Path("./data/buildings").exists():
+                print("[BUILDINGS] No STL files found in ./output/buildings. Auto-converting...")
+                scale_xy, z_scale = _load_scale_info(Path("./output/tiles"))
+                convert_buildings(
+                    Path("./data/buildings"),
+                    Path("./output/buildings"),
+                    scale_xy=float(scale_xy),
+                    z_scale=float(z_scale),
+                    default_height=float(args.buildings_default_height),
+                    min_height=float(args.buildings_min_height),
+                    max_height=args.buildings_max_height,
+                    terrain_bbox=None,
+                    workers=int(args.buildings_workers),
+                    layer_name=str(args.buildings_layer),
+                    out_name=str(args.buildings_out_name).strip() or None,
+                )
+
         # Load + weld for seamless joins; solidify once globally if requested.
         merge_name = args.model_name.strip() or "terrain_merged"
         merge_stls_mesh(
@@ -1785,6 +2436,7 @@ def main() -> None:
             base_z_value=args.base_z,
             base_mode=str(args.base_mode),
             z_scale=float(args.merge_z_scale),
+            include_buildings=bool(args.include_buildings),
             clip_border=bool(args.clip_border),
             border_geom=border_geom,
         )
@@ -1800,7 +2452,7 @@ def main() -> None:
         tif_count = len([p for p in input_files if p.suffix.lower() in {".tif", ".tiff"}])
         print(
             f"Found {len(input_files)} input file(s) "
-            f"({xyz_count} XYZ, {tif_count} TIF) under ./data/xyz, ./data/tif, or ./data"
+            f"({xyz_count} XYZ, {tif_count} TIF) under ./data/terrain/xyz, ./data/terrain/tif, or ./data/terrain"
         )
 
         target_size_mm = args.target_size_mm
@@ -1846,6 +2498,7 @@ def main() -> None:
                 scale=float(auto_scale),
                 target_resolution_mm=float(args.target_resolution_mm),
             )
+        terrain_scale = float(auto_scale)
 
         output_tiles_dir = Path("./output/tiles")
         if args.clean_tiles and output_tiles_dir.exists():
@@ -1906,29 +2559,62 @@ def main() -> None:
                     _convert_worker(task)
                 except Exception as e:
                     print(f"ERROR converting {input_path}: {e}")
-            return
+            did_any = True
+        else:
+            total = len(tasks)
+            completed = 0
+            failures = 0
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                future_map = {executor.submit(_convert_worker, task): task for task in tasks}
+                for future in as_completed(future_map):
+                    task = future_map[future]
+                    input_path = task[0]
+                    completed += 1
+                    try:
+                        future.result()
+                    except Exception as e:
+                        failures += 1
+                        print(f"ERROR converting {input_path}: {e}")
+                    print(f"[PROGRESS] {completed}/{total} {input_path.name}")
 
-        total = len(tasks)
-        completed = 0
-        failures = 0
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_map = {executor.submit(_convert_worker, task): task for task in tasks}
-            for future in as_completed(future_map):
-                task = future_map[future]
-                input_path = task[0]
-                completed += 1
-                try:
-                    future.result()
-                except Exception as e:
-                    failures += 1
-                    print(f"ERROR converting {input_path}: {e}")
-                print(f"[PROGRESS] {completed}/{total} {input_path.name}")
+            if failures:
+                print(f"[WARN] {failures} tile(s) failed during conversion.")
+            did_any = True
 
-        if failures:
-            print(f"[WARN] {failures} tile(s) failed during conversion.")
-        return
+    if args.buildings:
+        if terrain_scale is None:
+            scale_xy, z_scale = _load_scale_info(Path("./output/tiles"))
+            if scale_xy == 1.0 and z_scale == 1.0:
+                print("[WARN] No scale_info.json found; buildings will use scale 1.0")
+        else:
+            scale_xy = float(terrain_scale)
+            z_scale = float(args.z_scale)
 
-    ap.error("Use --all to convert tiles or --merge-stl <out.stl> to merge.")
+        terrain_bbox = None
+        try:
+            input_files = _list_input_files()
+            min_x, max_x, min_y, max_y, _ = scan_input_bounds_and_resolution(input_files)
+            terrain_bbox = (min_x, min_y, max_x, max_y)
+        except SystemExit:
+            terrain_bbox = None
+
+        convert_buildings(
+            Path(args.buildings_dir),
+            Path(args.buildings_out),
+            scale_xy=float(scale_xy),
+            z_scale=float(z_scale),
+            default_height=float(args.buildings_default_height),
+            min_height=float(args.buildings_min_height),
+            max_height=args.buildings_max_height,
+            terrain_bbox=terrain_bbox,
+            workers=int(args.buildings_workers),
+            layer_name=str(args.buildings_layer),
+            out_name=str(args.buildings_out_name).strip() or None,
+        )
+        did_any = True
+
+    if not did_any:
+        ap.error("Use --all to convert terrain, --buildings to convert buildings, or --merge-stl <out.stl> to merge.")
 
 
 if __name__ == "__main__":

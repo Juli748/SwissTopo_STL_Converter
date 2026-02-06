@@ -86,10 +86,10 @@ def _maybe_clear_inputs(xyz_dir: Path, tif_dir: Path, clean_xyz: bool) -> None:
         return
 
     if not sys.stdin.isatty():
-        print("Existing XYZ/TIF files found in ./data. Keeping them (non-interactive).")
+        print("Existing XYZ/TIF files found in ./data/terrain. Keeping them (non-interactive).")
         return
 
-    response = input("Existing files found in ./data/xyz or ./data/tif. Delete them? [y/N]: ").strip().lower()
+    response = input("Existing files found in ./data/terrain/xyz or ./data/terrain/tif. Delete them? [y/N]: ").strip().lower()
     if response in {"y", "yes"}:
         for file_path in existing_xyz_files + existing_tif_files:
             try:
@@ -107,6 +107,13 @@ def _download_and_unzip(url, filename, zips_temp_dir, extract_dir):
     return filename
 
 
+def _download_and_unzip_flat(url, filename, zips_temp_dir, extract_dir):
+    zip_path = zips_temp_dir / filename
+    download_file(url, zip_path)
+    unzip_file(zip_path, extract_dir)
+    return filename
+
+
 def _has_xyz_for_zip(xyz_dir: Path, filename: str) -> bool:
     stem = Path(filename).stem
     if (xyz_dir / f"{stem}.xyz").exists():
@@ -120,6 +127,10 @@ def _classify_url(url: str) -> tuple[str, str]:
     if not filename:
         return "unknown", filename
     lower = filename.lower()
+    if lower.endswith(".gdb.zip") or lower.endswith(".gdb"):
+        return "building_gdb", filename
+    if "swissbuildings3d" in lower:
+        return "building_gdb", filename
     if lower.endswith(".zip"):
         return "zip", filename
     if lower.endswith(".tif") or lower.endswith(".tiff"):
@@ -130,7 +141,7 @@ def _classify_url(url: str) -> tuple[str, str]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download SwissTopo XYZ or GeoTIFF tiles from CSV URLs.")
+    parser = argparse.ArgumentParser(description="Download SwissTopo terrain tiles or building GDBs from CSV URLs.")
     parser.add_argument(
         "--csv",
         dest="csv_path",
@@ -140,7 +151,7 @@ def main():
     parser.add_argument(
         "--clean-xyz",
         action="store_true",
-        help="Delete existing files in ./data/xyz and ./data/tif before downloading.",
+        help="Delete existing files in ./data/terrain/xyz and ./data/terrain/tif before downloading.",
     )
     parser.add_argument(
         "--workers",
@@ -157,17 +168,25 @@ def main():
     if not csv_files:
         return 1
 
-    extract_dir = data_dir / "_extract_temp"
-    extract_dir.mkdir(parents=True, exist_ok=True)
-    zips_temp_dir = data_dir / "_zips_temp"
-    zips_temp_dir.mkdir(parents=True, exist_ok=True)
-    clear_directory(extract_dir)
-    clear_directory(zips_temp_dir)
-    xyz_dir = data_dir / "xyz"
+    terrain_dir = data_dir / "terrain"
+    terrain_dir.mkdir(parents=True, exist_ok=True)
+    terrain_extract_dir = terrain_dir / "_extract_temp"
+    terrain_extract_dir.mkdir(parents=True, exist_ok=True)
+    terrain_zips_temp_dir = terrain_dir / "_zips_temp"
+    terrain_zips_temp_dir.mkdir(parents=True, exist_ok=True)
+    clear_directory(terrain_extract_dir)
+    clear_directory(terrain_zips_temp_dir)
+    xyz_dir = terrain_dir / "xyz"
     xyz_dir.mkdir(parents=True, exist_ok=True)
-    tif_dir = data_dir / "tif"
+    tif_dir = terrain_dir / "tif"
     tif_dir.mkdir(parents=True, exist_ok=True)
     _maybe_clear_inputs(xyz_dir, tif_dir, args.clean_xyz)
+
+    buildings_dir = data_dir / "buildings"
+    buildings_dir.mkdir(parents=True, exist_ok=True)
+    buildings_zips_temp_dir = buildings_dir / "_zips_temp"
+    buildings_zips_temp_dir.mkdir(parents=True, exist_ok=True)
+    clear_directory(buildings_zips_temp_dir)
 
     urls = []
     for csv_path in csv_files:
@@ -186,6 +205,12 @@ def main():
             already = (tif_dir / filename).exists()
         elif kind == "xyz":
             already = (xyz_dir / filename).exists()
+        elif kind == "building_gdb":
+            if filename.lower().endswith(".gdb"):
+                target_name = filename
+            else:
+                target_name = Path(filename).stem
+            already = (buildings_dir / target_name).exists()
         else:
             print(f"Skip (unsupported URL): {url}")
             continue
@@ -208,7 +233,7 @@ def main():
         tasks.append((url, filename, kind))
     with ThreadPoolExecutor(max_workers=workers) as executor:
         future_map = {
-            executor.submit(_download_and_unzip, url, filename, zips_temp_dir, extract_dir): (url, filename)
+            executor.submit(_download_and_unzip, url, filename, terrain_zips_temp_dir, terrain_extract_dir): (url, filename)
             for url, filename, kind in tasks
             if kind == "zip"
         }
@@ -217,6 +242,8 @@ def main():
                 future_map[executor.submit(download_file, url, tif_dir / filename)] = (url, filename)
             elif kind == "xyz":
                 future_map[executor.submit(download_file, url, xyz_dir / filename)] = (url, filename)
+            elif kind == "building_gdb":
+                future_map[executor.submit(_download_and_unzip_flat, url, filename, buildings_zips_temp_dir, buildings_dir)] = (url, filename)
         for future in as_completed(future_map):
             url, filename = future_map[future]
             completed += 1
@@ -226,18 +253,27 @@ def main():
                 print(f"Failed: {url} ({exc})")
             print(f"[PROGRESS] {completed}/{total} {filename}")
     # Best-effort cleanup of temp zip folder.
-    for zip_path in zips_temp_dir.glob("*"):
+    for zip_path in terrain_zips_temp_dir.glob("*"):
         try:
             zip_path.unlink()
         except OSError:
             pass
     try:
-        zips_temp_dir.rmdir()
+        terrain_zips_temp_dir.rmdir()
+    except OSError:
+        pass
+    for zip_path in buildings_zips_temp_dir.glob("*"):
+        try:
+            zip_path.unlink()
+        except OSError:
+            pass
+    try:
+        buildings_zips_temp_dir.rmdir()
     except OSError:
         pass
 
     copied = 0
-    for file_path in extract_dir.rglob("*.xyz"):
+    for file_path in terrain_extract_dir.rglob("*.xyz"):
         if file_path.is_file():
             shutil.copy2(file_path, xyz_dir / file_path.name)
             copied += 1

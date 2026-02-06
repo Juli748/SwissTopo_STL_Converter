@@ -74,13 +74,19 @@ class App(tk.Tk):
         self.minsize(target_w, target_h)
 
         self.data_dir = Path(__file__).resolve().parent / "data"
-        self.xyz_dir = self.data_dir / "xyz"
+        self.terrain_dir = self.data_dir / "terrain"
+        self.xyz_dir = self.terrain_dir / "xyz"
+        self.tif_dir = self.terrain_dir / "tif"
+        self.buildings_dir = self.data_dir / "buildings"
         self.output_dir = Path(__file__).resolve().parent / "output"
         self.tiles_dir = self.output_dir / "tiles"
         self.borders_dir = Path(__file__).resolve().parent / "borders"
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.terrain_dir.mkdir(parents=True, exist_ok=True)
         self.xyz_dir.mkdir(parents=True, exist_ok=True)
+        self.tif_dir.mkdir(parents=True, exist_ok=True)
+        self.buildings_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.tiles_dir.mkdir(parents=True, exist_ok=True)
 
@@ -100,6 +106,12 @@ class App(tk.Tk):
         self.merge_progress_label_var = tk.StringVar(value="")
         self.merge_border_mode_var = tk.StringVar(value=DEFAULTS["merge_border_mode"])
         self.border_scale_var = tk.StringVar(value=DEFAULTS["border_scale"])
+        self.download_all_csv_var = tk.BooleanVar(value=DEFAULTS["download_all_csv"])
+        self.convert_buildings_var = tk.BooleanVar(value=DEFAULTS["convert_buildings"])
+        self.buildings_default_height_var = tk.StringVar(value=DEFAULTS["buildings_default_height"])
+        self.buildings_workers_var = tk.StringVar(value=DEFAULTS["buildings_workers"])
+        self.buildings_layer_var = tk.StringVar(value=DEFAULTS["buildings_layer"])
+        self.include_buildings_var = tk.BooleanVar(value=DEFAULTS["include_buildings"])
         self.border_options = self._discover_border_shp()
         default_border_label = self._select_default_border_label()
         self.border_shp_var = tk.StringVar(value=default_border_label)
@@ -271,7 +283,7 @@ class App(tk.Tk):
         return "break"
 
     def _build_step_download(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="1) Download XYZ/TIF tiles")
+        frame = ttk.LabelFrame(parent, text="1) Download terrain/building data")
         frame.pack(fill=tk.X)
 
         csv_label = ttk.Label(frame, text="CSV with download URLs:")
@@ -283,24 +295,32 @@ class App(tk.Tk):
         browse_btn.grid(row=0, column=2, padx=4, pady=2)
         copy_btn = ttk.Button(frame, text="Copy to data/", command=self._copy_csv)
         copy_btn.grid(row=0, column=3, padx=4, pady=2)
+        self._download_csv_widgets = [entry, browse_btn, copy_btn]
+        all_csv_chk = ttk.Checkbutton(
+            frame,
+            text="Use all CSVs in data/",
+            variable=self.download_all_csv_var,
+            command=self._update_download_controls,
+        )
+        all_csv_chk.grid(row=1, column=1, sticky=tk.W, pady=2)
 
         download_note = ttk.Label(
             frame,
-            text="Download into data/xyz and data/tif using download_tiles.py",
+            text="Download into data/terrain and data/buildings using download_tiles.py",
         )
         workers_label = ttk.Label(frame, text="Max parallel downloads:")
-        workers_label.grid(row=1, column=0, sticky=tk.W, pady=2)
+        workers_label.grid(row=2, column=0, sticky=tk.W, pady=2)
         self.download_workers_var = tk.StringVar(value=DEFAULTS["download_workers"])
         workers_entry = ttk.Entry(frame, textvariable=self.download_workers_var, width=8)
-        workers_entry.grid(row=1, column=1, sticky=tk.W)
+        workers_entry.grid(row=2, column=1, sticky=tk.W)
 
-        download_note.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
+        download_note.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=2)
         self.download_btn = ttk.Button(frame, text="Run Download", command=self._run_download)
-        self.download_btn.grid(row=2, column=3, padx=4, pady=6)
+        self.download_btn.grid(row=3, column=3, padx=4, pady=6)
         self.status_vars["download"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["download"] = ttk.Label(frame, textvariable=self.status_vars["download"])
         self.status_labels["download"].grid(
-            row=2, column=4, sticky=tk.W, padx=(8, 0)
+            row=3, column=4, sticky=tk.W, padx=(8, 0)
         )
         self.status_labels["download"].configure(width=12)
         self.download_progress = ttk.Progressbar(
@@ -310,9 +330,9 @@ class App(tk.Tk):
             mode="determinate",
             length=220,
         )
-        self.download_progress.grid(row=3, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.download_progress.grid(row=4, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.download_progress_label = ttk.Label(frame, textvariable=self.download_progress_label_var)
-        self.download_progress_label.grid(row=3, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.download_progress_label.grid(row=4, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.download_progress_label.configure(width=26)
 
         frame.columnconfigure(0, minsize=200)
@@ -339,6 +359,10 @@ class App(tk.Tk):
                 "Copies the CSV into ./data so it is picked up automatically next time.",
             ),
             Tooltip(
+                all_csv_chk,
+                "When enabled, all CSVs in ./data are used and the single CSV path is ignored.",
+            ),
+            Tooltip(
                 workers_label,
                 "How many downloads to run in parallel. Higher is faster but uses more bandwidth.",
             ),
@@ -348,16 +372,17 @@ class App(tk.Tk):
             ),
             Tooltip(
                 self.download_btn,
-                "Runs download_tiles.py to fetch tiles into ./data/xyz and ./data/tif.",
+                "Runs download_tiles.py to fetch terrain tiles into ./data/terrain and building GDBs into ./data/buildings.",
             ),
             Tooltip(
                 download_note,
-                "Tiles are stored under ./data/xyz as .xyz files and ./data/tif as GeoTIFF.",
+                "Terrain tiles go to ./data/terrain/xyz and ./data/terrain/tif. Buildings go to ./data/buildings.",
             ),
         ]
+        self._update_download_controls()
 
     def _build_step_convert(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="2) Convert XYZ/TIF to STL tiles")
+        frame = ttk.LabelFrame(parent, text="2) Convert terrain/buildings to STL")
         frame.pack(fill=tk.X)
 
         self.mode_var = tk.StringVar(value=DEFAULTS["mode"])
@@ -463,21 +488,42 @@ class App(tk.Tk):
         z_scale_entry = ttk.Entry(frame, textvariable=self.z_scale_var, width=10)
         z_scale_entry.grid(row=5, column=3, sticky=tk.W)
 
+        buildings_chk = ttk.Checkbutton(
+            frame,
+            text="Convert buildings (data/buildings)",
+            variable=self.convert_buildings_var,
+            command=self._update_buildings_controls,
+        )
+        buildings_chk.grid(row=6, column=0, sticky=tk.W, pady=4)
+        self.buildings_height_label = ttk.Label(frame, text="Default building height (m):")
+        self.buildings_height_label.grid(row=6, column=1, sticky=tk.W)
+        self.buildings_height_entry = ttk.Entry(frame, textvariable=self.buildings_default_height_var, width=10)
+        self.buildings_height_entry.grid(row=6, column=2, sticky=tk.W)
+        self.buildings_workers_label = ttk.Label(frame, text="Buildings workers:")
+        self.buildings_workers_label.grid(row=6, column=3, sticky=tk.W, padx=(12, 0))
+        self.buildings_workers_entry = ttk.Entry(frame, textvariable=self.buildings_workers_var, width=8)
+        self.buildings_workers_entry.grid(row=6, column=4, sticky=tk.W)
+
+        self.buildings_layer_label = ttk.Label(frame, text="Buildings layer:")
+        self.buildings_layer_label.grid(row=7, column=1, sticky=tk.W)
+        self.buildings_layer_entry = ttk.Entry(frame, textvariable=self.buildings_layer_var, width=14)
+        self.buildings_layer_entry.grid(row=7, column=2, sticky=tk.W)
+
         auto_hint = ttk.Label(frame, text="Auto = program picks step to hit print size.")
-        auto_hint.grid(row=6, column=0, columnspan=3, sticky=tk.W)
+        auto_hint.grid(row=8, column=0, columnspan=3, sticky=tk.W)
 
         convert_workers_label = ttk.Label(frame, text="Max parallel conversions:")
-        convert_workers_label.grid(row=7, column=0, sticky=tk.W, pady=4)
+        convert_workers_label.grid(row=9, column=0, sticky=tk.W, pady=4)
         self.convert_workers_var = tk.StringVar(value=DEFAULTS["convert_workers"])
         convert_workers_entry = ttk.Entry(frame, textvariable=self.convert_workers_var, width=10)
-        convert_workers_entry.grid(row=7, column=1, sticky=tk.W)
+        convert_workers_entry.grid(row=9, column=1, sticky=tk.W)
 
         self.convert_btn = ttk.Button(frame, text="Run Conversion", command=self._run_convert)
-        self.convert_btn.grid(row=8, column=3, sticky=tk.E, padx=4, pady=6)
+        self.convert_btn.grid(row=10, column=3, sticky=tk.E, padx=4, pady=6)
         self.status_vars["convert"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["convert"] = ttk.Label(frame, textvariable=self.status_vars["convert"])
         self.status_labels["convert"].grid(
-            row=8, column=2, sticky=tk.W, padx=(12, 0)
+            row=10, column=2, sticky=tk.W, padx=(12, 0)
         )
         self.convert_progress = ttk.Progressbar(
             frame,
@@ -486,12 +532,13 @@ class App(tk.Tk):
             mode="determinate",
             length=220,
         )
-        self.convert_progress.grid(row=9, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress.grid(row=11, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.convert_progress_label = ttk.Label(frame, textvariable=self.convert_progress_label_var)
-        self.convert_progress_label.grid(row=9, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress_label.grid(row=11, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.convert_progress_label.configure(width=26)
 
         self._update_convert_mode()
+        self._update_buildings_controls()
 
         self.tooltips += [
             Tooltip(
@@ -587,6 +634,34 @@ class App(tk.Tk):
                 "Example: 2.0 doubles height for exaggeration.",
             ),
             Tooltip(
+                buildings_chk,
+                "Also convert building GDBs from ./data/buildings into ./output/buildings (--buildings).",
+            ),
+            Tooltip(
+                self.buildings_height_label,
+                "Used only when building features have no height or Z info.",
+            ),
+            Tooltip(
+                self.buildings_height_entry,
+                "Fallback height in meters (input units).",
+            ),
+            Tooltip(
+                self.buildings_workers_label,
+                "Parallel workers for building conversion.",
+            ),
+            Tooltip(
+                self.buildings_workers_entry,
+                "Try 2-6 depending on your CPU and disk speed.",
+            ),
+            Tooltip(
+                self.buildings_layer_label,
+                "Layer name to use (auto prefers Roof). Leave 'auto' for best default.",
+            ),
+            Tooltip(
+                self.buildings_layer_entry,
+                "Examples: Roof, Building, Footprint. Use exact layer name.",
+            ),
+            Tooltip(
                 auto_hint,
                 "Auto mode ignores the manual step field.",
             ),
@@ -661,6 +736,13 @@ class App(tk.Tk):
         self.base_z_label.grid(row=3, column=0, sticky=tk.W, pady=2)
         self.base_z_entry = ttk.Entry(frame, textvariable=self.base_z_var, width=10)
         self.base_z_entry.grid(row=3, column=1, sticky=tk.W)
+
+        include_buildings_chk = ttk.Checkbutton(
+            frame,
+            text="Include buildings",
+            variable=self.include_buildings_var,
+        )
+        include_buildings_chk.grid(row=3, column=2, sticky=tk.W, pady=2)
 
         border_mode_label = ttk.Label(frame, text="Border clipping:")
         border_mode_label.grid(row=4, column=0, sticky=tk.W, pady=2)
@@ -805,6 +887,10 @@ class App(tk.Tk):
             Tooltip(
                 self.base_z_entry,
                 "Leave blank to use base thickness instead.",
+            ),
+            Tooltip(
+                include_buildings_chk,
+                "Also merge STL files from ./output/buildings (--include-buildings).",
             ),
             Tooltip(
                 border_mode_label,
@@ -1195,6 +1281,8 @@ class App(tk.Tk):
 
     def _load_default_csv(self) -> None:
         csv_files = sorted(self.data_dir.glob("*.csv"))
+        if self.download_all_csv_var.get():
+            return
         if csv_files and not self.csv_path_var.get().strip():
             self.csv_path_var.set(str(csv_files[0]))
 
@@ -1215,6 +1303,13 @@ class App(tk.Tk):
         self.csv_path_var.set(str(dest))
         self._log(f"Copied CSV to {dest}")
 
+    def _update_download_controls(self) -> None:
+        use_all = bool(self.download_all_csv_var.get())
+        state = "disabled" if use_all else "normal"
+        self.csv_path_var.set("" if use_all else self.csv_path_var.get())
+        for widget in self._download_csv_widgets:
+            widget.configure(state=state)
+
     def _browse_merge_out(self) -> None:
         path = filedialog.asksaveasfilename(
             title="Save merged STL",
@@ -1230,21 +1325,21 @@ class App(tk.Tk):
         self.download_progress_var.set(0.0)
         self.download_progress_label_var.set("")
         args = [sys.executable, "download_tiles.py"]
-        csv_path = self.csv_path_var.get().strip()
-        if csv_path:
-            args += ["--csv", csv_path]
+        if not self.download_all_csv_var.get():
+            csv_path = self.csv_path_var.get().strip()
+            if csv_path:
+                args += ["--csv", csv_path]
         workers = self.download_workers_var.get().strip()
         if workers:
             args += ["--workers", workers]
 
-        tif_dir = self.data_dir / "tif"
-        tif_dir.mkdir(parents=True, exist_ok=True)
+        self.tif_dir.mkdir(parents=True, exist_ok=True)
         existing_xyz = [p for p in self.xyz_dir.iterdir() if p.is_file()]
-        existing_tif = [p for p in tif_dir.iterdir() if p.is_file()]
+        existing_tif = [p for p in self.tif_dir.iterdir() if p.is_file()]
         if existing_xyz or existing_tif:
             if messagebox.askyesno(
                 "Replace existing files?",
-                "Existing XYZ or TIF files found in data/xyz or data/tif. Delete them before downloading?",
+                "Existing XYZ or TIF files found in data/terrain/xyz or data/terrain/tif. Delete them before downloading?",
             ):
                 args.append("--clean-xyz")
 
@@ -1315,6 +1410,18 @@ class App(tk.Tk):
         if model_name:
             args += ["--model-name", model_name]
 
+        if self.convert_buildings_var.get():
+            args.append("--buildings")
+            default_height = self.buildings_default_height_var.get().strip()
+            if default_height:
+                args += ["--buildings-default-height", default_height]
+            workers = self.buildings_workers_var.get().strip()
+            if workers:
+                args += ["--buildings-workers", workers]
+            layer_name = self.buildings_layer_var.get().strip()
+            if layer_name:
+                args += ["--buildings-layer", layer_name]
+
         self._run_command(args, "Convert tiles", status_key="convert")
 
     def _run_merge(self) -> None:
@@ -1374,6 +1481,9 @@ class App(tk.Tk):
         model_name = self.model_name_var.get().strip()
         if model_name:
             args += ["--model-name", model_name]
+
+        if self.include_buildings_var.get():
+            args.append("--include-buildings")
 
         self._run_command(args, "Merge tiles", status_key="merge")
 
@@ -1500,6 +1610,16 @@ class App(tk.Tk):
         self.step_label.configure(foreground="#e2e8f0" if enable_step else "#6b7280")
         self.tile_size_label.configure(foreground="#e2e8f0" if enable_tile else "#6b7280")
         self.scale_ratio_label.configure(foreground="#e2e8f0" if enable_ratio else "#6b7280")
+
+    def _update_buildings_controls(self) -> None:
+        enabled = bool(self.convert_buildings_var.get())
+        state = "normal" if enabled else "disabled"
+        self.buildings_height_entry.configure(state=state)
+        self.buildings_height_label.configure(foreground="#e2e8f0" if enabled else "#6b7280")
+        self.buildings_workers_entry.configure(state=state)
+        self.buildings_workers_label.configure(foreground="#e2e8f0" if enabled else "#6b7280")
+        self.buildings_layer_entry.configure(state=state)
+        self.buildings_layer_label.configure(foreground="#e2e8f0" if enabled else "#6b7280")
 
     def _update_merge_controls(self) -> None:
         make_solid = self.make_solid_var.get()
