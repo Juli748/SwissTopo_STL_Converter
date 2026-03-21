@@ -101,18 +101,30 @@ class App(tk.Tk):
         self.convert_progress_label_var = tk.StringVar(value="")
         self.merge_progress_var = tk.DoubleVar(value=0.0)
         self.merge_progress_label_var = tk.StringVar(value="")
+        self.pipeline_status_var = tk.StringVar(value="")
+        self.input_summary_var = tk.StringVar(value="")
+        self.tiles_summary_var = tk.StringVar(value="")
+        self.output_summary_var = tk.StringVar(value="")
+        self.detail_summary_var = tk.StringVar(value="")
+        self.merge_summary_var = tk.StringVar(value="")
         self.merge_border_mode_var = tk.StringVar(value=DEFAULTS["merge_border_mode"])
         self.border_scale_var = tk.StringVar(value=DEFAULTS["border_scale"])
+        self.detail_preset_var = tk.StringVar(value=DEFAULTS["detail_preset"])
+        self.show_convert_advanced_var = tk.BooleanVar(value=DEFAULTS["show_convert_advanced"])
+        self.show_merge_advanced_var = tk.BooleanVar(value=DEFAULTS["show_merge_advanced"])
         self.border_options = self._discover_border_shp()
         default_border_label = self._select_default_border_label()
         self.border_shp_var = tk.StringVar(value=default_border_label)
         self.border_keep_var = tk.StringVar(value="")
         self.border_keep_options: list[str] = []
         self.border_keep_all_label = "(all touched)"
+        self.pending_commands: list[tuple[list[str], str, str]] = []
+        self.pipeline_running = False
 
         self._setup_theme()
         self._build_ui()
         self._load_default_csv()
+        self._refresh_pipeline_summary()
         self._poll_log()
 
     def _setup_theme(self) -> None:
@@ -191,7 +203,7 @@ class App(tk.Tk):
         ttk.Label(header, text=DEFAULTS["window_title"], style="Header.TLabel").pack(anchor=tk.W)
         ttk.Label(
             header,
-            text="Download tiles, convert to STL, then merge into a print-ready model.",
+            text="Pick a CSV, choose a print size, then build a print-ready STL.",
         ).pack(anchor=tk.W)
         name_row = ttk.Frame(header)
         name_row.pack(fill=tk.X, pady=(6, 0))
@@ -199,12 +211,31 @@ class App(tk.Tk):
         self.model_name_entry = ttk.Entry(name_row, textvariable=self.model_name_var, width=24)
         self.model_name_entry.pack(side=tk.LEFT, padx=(6, 0))
         self.model_name_entry.bind("<KeyRelease>", self._on_model_name_change)
+        ttk.Button(name_row, text="Refresh Status", command=self._refresh_pipeline_summary).pack(side=tk.RIGHT)
         self.tooltips.append(
             Tooltip(
                 self.model_name_entry,
                 "Used to name output STL files and the STL solid name.",
             )
         )
+
+        summary = ttk.LabelFrame(main, text="Pipeline Overview")
+        summary.pack(fill=tk.X, pady=(0, 8))
+        ttk.Label(summary, textvariable=self.pipeline_status_var, style="Header.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 4)
+        )
+        ttk.Label(summary, text="Inputs").grid(row=1, column=0, sticky=tk.W)
+        ttk.Label(summary, textvariable=self.input_summary_var).grid(row=2, column=0, sticky=tk.W, padx=(0, 16))
+        ttk.Label(summary, text="STL tiles").grid(row=1, column=1, sticky=tk.W)
+        ttk.Label(summary, textvariable=self.tiles_summary_var).grid(row=2, column=1, sticky=tk.W, padx=(0, 16))
+        ttk.Label(summary, text="Final STL").grid(row=1, column=2, sticky=tk.W)
+        ttk.Label(summary, textvariable=self.output_summary_var).grid(row=2, column=2, sticky=tk.W)
+        ttk.Button(summary, text="Run Full Pipeline", command=self._run_full_pipeline).grid(
+            row=0, column=2, sticky=tk.E
+        )
+        summary.columnconfigure(0, weight=1)
+        summary.columnconfigure(1, weight=1)
+        summary.columnconfigure(2, weight=1)
 
         steps = ttk.Frame(main)
         steps.pack(fill=tk.X)
@@ -373,115 +404,147 @@ class App(tk.Tk):
         self.step_var = tk.StringVar(value=DEFAULTS["step"])
         self.tol_var = tk.StringVar(value=DEFAULTS["grid_tolerance"])
         self.z_scale_var = tk.StringVar(value=DEFAULTS["z_scale"])
+        intro = ttk.Label(
+            frame,
+            text="Default path: pick a final print size and a detail preset. Advanced controls stay hidden until needed.",
+        )
+        intro.grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=(0, 6))
 
-        mode_label = ttk.Label(frame, text="Choose how detail is set:")
+        basic = ttk.Frame(frame)
+        basic.grid(row=1, column=0, columnspan=4, sticky=tk.EW)
+
+        self.target_size_label = ttk.Label(basic, text="Final model size (mm):")
+        self.target_size_label.grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.target_size_entry = ttk.Entry(basic, textvariable=self.target_size_var, width=10)
+        self.target_size_entry.grid(row=0, column=1, sticky=tk.W)
+
+        self.target_edge_label = ttk.Label(basic, text="Fit this edge:")
+        self.target_edge_label.grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
+        self.target_edge_combo = ttk.Combobox(
+            basic,
+            textvariable=self.target_edge_var,
+            values=["shortest", "longest"],
+            state="readonly",
+            width=10,
+        )
+        self.target_edge_combo.grid(row=0, column=3, sticky=tk.W)
+
+        detail_label = ttk.Label(basic, text="Detail preset:")
+        detail_label.grid(row=1, column=0, sticky=tk.W, pady=4)
+        detail_combo = ttk.Combobox(
+            basic,
+            textvariable=self.detail_preset_var,
+            values=["draft", "balanced", "fine", "custom"],
+            state="readonly",
+            width=12,
+        )
+        detail_combo.grid(row=1, column=1, sticky=tk.W)
+        detail_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_convert_mode())
+
+        detail_hint = ttk.Label(basic, textvariable=self.detail_summary_var)
+        detail_hint.grid(row=1, column=2, columnspan=2, sticky=tk.W, padx=(12, 0))
+
+        self.target_res_label = ttk.Label(basic, text="Target XY spacing (mm):")
+        self.target_res_label.grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.target_res_entry = ttk.Entry(basic, textvariable=self.target_res_var, width=10)
+        self.target_res_entry.grid(row=2, column=1, sticky=tk.W)
+
+        self.z_scale_label = ttk.Label(basic, text="Height exaggeration:")
+        self.z_scale_label.grid(row=2, column=2, sticky=tk.W, padx=(12, 0))
+        z_scale_entry = ttk.Entry(basic, textvariable=self.z_scale_var, width=10)
+        z_scale_entry.grid(row=2, column=3, sticky=tk.W)
+
+        basic.columnconfigure(1, weight=1)
+        basic.columnconfigure(3, weight=1)
+
+        advanced_toggle = ttk.Checkbutton(
+            frame,
+            text="Show advanced conversion settings",
+            variable=self.show_convert_advanced_var,
+            command=self._update_convert_mode,
+        )
+        advanced_toggle.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(8, 4))
+
+        self.convert_advanced_frame = ttk.Frame(frame)
+        self.convert_advanced_frame.grid(row=3, column=0, columnspan=4, sticky=tk.EW)
+
+        mode_label = ttk.Label(self.convert_advanced_frame, text="Detail control:")
         mode_label.grid(row=0, column=0, sticky=tk.W, pady=4)
         auto_radio = ttk.Radiobutton(
-            frame,
-            text="Auto (size in mm)",
+            self.convert_advanced_frame,
+            text="Auto",
             value="auto",
             variable=self.mode_var,
             command=self._update_convert_mode,
         )
         auto_radio.grid(row=0, column=1, sticky=tk.W)
         manual_radio = ttk.Radiobutton(
-            frame,
-            text="Manual (step)",
+            self.convert_advanced_frame,
+            text="Manual step",
             value="manual",
             variable=self.mode_var,
             command=self._update_convert_mode,
         )
         manual_radio.grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
 
-        scale_mode_label = ttk.Label(frame, text="Scale by:")
+        scale_mode_label = ttk.Label(self.convert_advanced_frame, text="Scale source:")
         scale_mode_label.grid(row=1, column=0, sticky=tk.W, pady=4)
         scale_target_radio = ttk.Radiobutton(
-            frame,
-            text="Target size (merged)",
+            self.convert_advanced_frame,
+            text="Final model size",
             value="target_size",
             variable=self.scale_mode_var,
             command=self._update_convert_mode,
         )
         scale_target_radio.grid(row=1, column=1, sticky=tk.W)
         scale_tile_radio = ttk.Radiobutton(
-            frame,
-            text="Tile size (1 km)",
+            self.convert_advanced_frame,
+            text="Fixed 1 km tile size",
             value="tile_size",
             variable=self.scale_mode_var,
             command=self._update_convert_mode,
         )
         scale_tile_radio.grid(row=1, column=2, sticky=tk.W, padx=(12, 0))
         scale_ratio_radio = ttk.Radiobutton(
-            frame,
-            text="Scale ratio (1:100)",
+            self.convert_advanced_frame,
+            text="Scale ratio",
             value="scale_ratio",
             variable=self.scale_mode_var,
             command=self._update_convert_mode,
         )
         scale_ratio_radio.grid(row=1, column=3, sticky=tk.W)
 
-        self.target_size_label = ttk.Label(frame, text="Target edge length (mm):")
-        self.target_size_label.grid(row=2, column=0, sticky=tk.W, pady=4)
-        self.target_size_entry = ttk.Entry(frame, textvariable=self.target_size_var, width=10)
-        self.target_size_entry.grid(row=2, column=1, sticky=tk.W)
+        self.step_label = ttk.Label(self.convert_advanced_frame, text="Downsample step:")
+        self.step_label.grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.step_entry = ttk.Entry(self.convert_advanced_frame, textvariable=self.step_var, width=10)
+        self.step_entry.grid(row=2, column=1, sticky=tk.W)
 
-        self.target_edge_label = ttk.Label(frame, text="Edge to fit:")
-        self.target_edge_label.grid(row=2, column=2, sticky=tk.W, padx=(12, 0))
-        self.target_edge_combo = ttk.Combobox(
-            frame,
-            textvariable=self.target_edge_var,
-            values=["shortest", "longest"],
-            state="readonly",
-            width=10,
-        )
-        self.target_edge_combo.grid(row=2, column=3, sticky=tk.W)
+        self.tile_size_label = ttk.Label(self.convert_advanced_frame, text="Tile size (mm for 1 km):")
+        self.tile_size_label.grid(row=2, column=2, sticky=tk.W, padx=(12, 0))
+        self.tile_size_entry = ttk.Entry(self.convert_advanced_frame, textvariable=self.tile_size_var, width=10)
+        self.tile_size_entry.grid(row=2, column=3, sticky=tk.W)
 
-        self.target_res_label = ttk.Label(frame, text="Target XY spacing (mm):")
-        self.target_res_label.grid(row=3, column=0, sticky=tk.W, pady=4)
-        self.target_res_entry = ttk.Entry(frame, textvariable=self.target_res_var, width=10)
-        self.target_res_entry.grid(row=3, column=1, sticky=tk.W)
+        self.scale_ratio_label = ttk.Label(self.convert_advanced_frame, text="Scale ratio (e.g. 1:100):")
+        self.scale_ratio_label.grid(row=3, column=0, sticky=tk.W, pady=4)
+        self.scale_ratio_entry = ttk.Entry(self.convert_advanced_frame, textvariable=self.scale_ratio_var, width=10)
+        self.scale_ratio_entry.grid(row=3, column=1, sticky=tk.W)
 
-        self.step_label = ttk.Label(frame, text="Downsample step:")
-        self.step_label.grid(row=3, column=2, sticky=tk.W, padx=(12, 0))
-        self.step_entry = ttk.Entry(frame, textvariable=self.step_var, width=10)
-        self.step_entry.grid(row=3, column=3, sticky=tk.W)
+        self.tol_label = ttk.Label(self.convert_advanced_frame, text="Grid tolerance:")
+        self.tol_label.grid(row=3, column=2, sticky=tk.W, padx=(12, 0))
+        tol_entry = ttk.Entry(self.convert_advanced_frame, textvariable=self.tol_var, width=10)
+        tol_entry.grid(row=3, column=3, sticky=tk.W)
 
-        self.tile_size_label = ttk.Label(frame, text="Tile size (mm for 1 km):")
-        self.tile_size_label.grid(row=4, column=0, sticky=tk.W, pady=4)
-        self.tile_size_entry = ttk.Entry(frame, textvariable=self.tile_size_var, width=10)
-        self.tile_size_entry.grid(row=4, column=1, sticky=tk.W)
-
-        self.scale_ratio_label = ttk.Label(frame, text="Scale ratio (e.g. 1:100):")
-        self.scale_ratio_label.grid(row=4, column=2, sticky=tk.W, padx=(12, 0))
-        self.scale_ratio_entry = ttk.Entry(frame, textvariable=self.scale_ratio_var, width=10)
-        self.scale_ratio_entry.grid(row=4, column=3, sticky=tk.W)
-
-        self.tol_label = ttk.Label(frame, text="Grid tolerance:")
-        self.tol_label.grid(row=5, column=0, sticky=tk.W, pady=4)
-        tol_entry = ttk.Entry(frame, textvariable=self.tol_var, width=10)
-        tol_entry.grid(row=5, column=1, sticky=tk.W)
-
-        self.z_scale_label = ttk.Label(frame, text="Z scale (tile conversion):")
-        self.z_scale_label.grid(row=5, column=2, sticky=tk.W, padx=(12, 0))
-        z_scale_entry = ttk.Entry(frame, textvariable=self.z_scale_var, width=10)
-        z_scale_entry.grid(row=5, column=3, sticky=tk.W)
-
-        auto_hint = ttk.Label(frame, text="Auto = program picks step to hit print size.")
-        auto_hint.grid(row=6, column=0, columnspan=3, sticky=tk.W)
-
-        convert_workers_label = ttk.Label(frame, text="Max parallel conversions:")
-        convert_workers_label.grid(row=7, column=0, sticky=tk.W, pady=4)
+        convert_workers_label = ttk.Label(self.convert_advanced_frame, text="Max parallel conversions:")
+        convert_workers_label.grid(row=4, column=0, sticky=tk.W, pady=4)
         self.convert_workers_var = tk.StringVar(value=DEFAULTS["convert_workers"])
-        convert_workers_entry = ttk.Entry(frame, textvariable=self.convert_workers_var, width=10)
-        convert_workers_entry.grid(row=7, column=1, sticky=tk.W)
+        convert_workers_entry = ttk.Entry(self.convert_advanced_frame, textvariable=self.convert_workers_var, width=10)
+        convert_workers_entry.grid(row=4, column=1, sticky=tk.W)
 
-        self.convert_btn = ttk.Button(frame, text="Run Conversion", command=self._run_convert)
-        self.convert_btn.grid(row=8, column=3, sticky=tk.E, padx=4, pady=6)
+        self.convert_btn = ttk.Button(frame, text="Create STL Tiles", command=self._run_convert)
+        self.convert_btn.grid(row=4, column=3, sticky=tk.E, padx=4, pady=6)
         self.status_vars["convert"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["convert"] = ttk.Label(frame, textvariable=self.status_vars["convert"])
-        self.status_labels["convert"].grid(
-            row=8, column=2, sticky=tk.W, padx=(12, 0)
-        )
+        self.status_labels["convert"].grid(row=4, column=2, sticky=tk.W, padx=(12, 0))
         self.convert_progress = ttk.Progressbar(
             frame,
             variable=self.convert_progress_var,
@@ -489,121 +552,40 @@ class App(tk.Tk):
             mode="determinate",
             length=220,
         )
-        self.convert_progress.grid(row=9, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress.grid(row=5, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.convert_progress_label = ttk.Label(frame, textvariable=self.convert_progress_label_var)
-        self.convert_progress_label.grid(row=9, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.convert_progress_label.grid(row=5, column=3, columnspan=2, sticky=tk.W, pady=(4, 0))
         self.convert_progress_label.configure(width=26)
+
+        frame.columnconfigure(1, weight=1)
+        frame.columnconfigure(3, weight=1)
 
         self._update_convert_mode()
 
         self.tooltips += [
             Tooltip(
-                mode_label,
-                "Auto chooses a downsample step to hit the requested print size. Manual lets you set the step.",
-            ),
-            Tooltip(
-                auto_radio,
-                "Auto: set a target print size; the tool computes an appropriate step.",
-            ),
-            Tooltip(
-                manual_radio,
-                "Manual: set the downsample step directly (keep every Nth point).",
-            ),
-            Tooltip(
-                scale_mode_label,
-                "Select how XY scale is defined for the tiles.",
-            ),
-            Tooltip(
-                scale_target_radio,
-                "Auto scale based on the chosen edge of the full merged area (--target-size-mm).",
-            ),
-            Tooltip(
-                scale_tile_radio,
-                "Set a fixed size for each 1 km input tile in mm (--tile-size-mm).",
-            ),
-            Tooltip(
-                scale_ratio_radio,
-                "Set a map scale like 1:100 (--scale-ratio). Assumes input units are meters.",
-            ),
-            Tooltip(
-                self.target_size_label,
-                "Chosen edge of the final print in mm. Used with Auto mode (--target-size-mm).",
-            ),
-            Tooltip(
                 self.target_size_entry,
-                "Example: 150 means the chosen edge of the merged model is ~150 mm.",
+                "The chosen edge of the merged model will be scaled to about this size in millimeters.",
             ),
             Tooltip(
-                self.target_edge_label,
-                "Select which XY edge to match the target size (--target-edge).",
-            ),
-            Tooltip(
-                self.target_edge_combo,
-                "Shortest is typical; longest helps ensure the model fits your print bed.",
-            ),
-            Tooltip(
-                self.target_res_label,
-                "Desired XY point spacing in mm when using Auto (--target-resolution-mm).",
+                detail_combo,
+                "Draft is fastest, Balanced is the default, Fine keeps more terrain detail, Custom unlocks manual control.",
             ),
             Tooltip(
                 self.target_res_entry,
-                "Lower values keep more detail but create larger STL files.",
-            ),
-            Tooltip(
-                self.step_label,
-                "Keep every Nth grid point in X and Y (--step). Larger step = fewer points.",
-            ),
-            Tooltip(
-                self.step_entry,
-                "Example: 10 keeps every 10th point.",
-            ),
-            Tooltip(
-                self.tile_size_label,
-                "Fixed tile side length in mm for a 1 km input tile (--tile-size-mm).",
-            ),
-            Tooltip(
-                self.tile_size_entry,
-                "Example: 200 makes each 1 km tile 200 mm wide.",
-            ),
-            Tooltip(
-                self.scale_ratio_label,
-                "Map scale like 1:100 or 100 (--scale-ratio).",
-            ),
-            Tooltip(
-                self.scale_ratio_entry,
-                "Example: 1:250 makes 1 mm on the model equal 250 mm real.",
-            ),
-            Tooltip(
-                self.tol_label,
-                "Snap X/Y to a grid to fix tiny coordinate noise (--tol). Use for messy data.",
-            ),
-            Tooltip(
-                tol_entry,
-                "Example: 0.001 snaps to 1 mm in map units if units are meters.",
-            ),
-            Tooltip(
-                self.z_scale_label,
-                "Multiply elevations by this factor during tile conversion (--z-scale).",
+                "Smaller spacing keeps more points and increases STL size. Ignored when using a manual step.",
             ),
             Tooltip(
                 z_scale_entry,
-                "Example: 2.0 doubles height for exaggeration.",
+                "Multiply terrain heights during tile conversion. Leave at 1.0 for true scale.",
             ),
             Tooltip(
-                auto_hint,
-                "Auto mode ignores the manual step field.",
-            ),
-            Tooltip(
-                convert_workers_label,
-                "How many tiles to convert in parallel. Higher is faster but uses more CPU/RAM.",
-            ),
-            Tooltip(
-                convert_workers_entry,
-                "Try 2-4 on a typical laptop. Set to 1 for sequential conversion.",
+                advanced_toggle,
+                "Show manual step, alternative scale modes, tolerance, and worker settings.",
             ),
             Tooltip(
                 self.convert_btn,
-                "Runs build_stl.py --all with the selected options.",
+                "Runs build_stl.py --all with the simplified settings above.",
             ),
         ]
 
@@ -620,99 +602,100 @@ class App(tk.Tk):
         self.base_mode_var = tk.StringVar(value=DEFAULTS["base_mode"])
         self.base_thickness_var = tk.StringVar(value=DEFAULTS["base_thickness"])
         self.base_z_var = tk.StringVar(value=DEFAULTS["base_z"])
-
-        merge_out_label = ttk.Label(frame, text="Output STL path:")
-        merge_out_label.grid(row=0, column=0, sticky=tk.W, pady=4)
-        merge_out_entry = ttk.Entry(frame, textvariable=self.merge_out_var)
-        merge_out_entry.grid(row=0, column=1, columnspan=3, sticky=tk.EW)
-        merge_out_btn = ttk.Button(frame, text="Browse", command=self._browse_merge_out)
-        merge_out_btn.grid(row=0, column=4, padx=4, pady=2)
-
-        weld_label = ttk.Label(frame, text="Weld tolerance:")
-        weld_label.grid(row=1, column=0, sticky=tk.W, pady=4)
-        weld_entry = ttk.Entry(frame, textvariable=self.weld_tol_var, width=10)
-        weld_entry.grid(row=1, column=1, sticky=tk.W)
-        merge_z_label = ttk.Label(frame, text="Merge Z scale:")
-        merge_z_label.grid(row=1, column=2, sticky=tk.W, padx=(12, 0))
-        merge_z_entry = ttk.Entry(frame, textvariable=self.merge_z_scale_var, width=10)
-        merge_z_entry.grid(row=1, column=3, sticky=tk.W)
-
-        self.merge_lake_lower_label = ttk.Label(frame, text="Lake lowering (mm):")
-        self.merge_lake_lower_label.grid(row=1, column=4, sticky=tk.W, padx=(12, 0))
-        self.merge_lake_lower_entry = ttk.Entry(frame, textvariable=self.merge_lake_lower_mm_var, width=10)
-        self.merge_lake_lower_entry.grid(row=1, column=5, sticky=tk.W)
-
-        make_solid_chk = ttk.Checkbutton(
+        intro = ttk.Label(
             frame,
-            text="Make solid",
+            text="Default path: merge all converted tiles into one printable STL with a base.",
+        )
+        intro.grid(row=0, column=0, sticky=tk.W, pady=(0, 6))
+
+        path_row = ttk.Frame(frame)
+        path_row.grid(row=1, column=0, sticky=tk.EW, pady=(0, 4))
+        merge_out_label = ttk.Label(path_row, text="Final STL path:")
+        merge_out_label.grid(row=0, column=0, sticky=tk.W, pady=4)
+        merge_out_entry = ttk.Entry(path_row, textvariable=self.merge_out_var)
+        merge_out_entry.grid(row=0, column=1, sticky=tk.EW, padx=(8, 8))
+        merge_out_btn = ttk.Button(path_row, text="Browse", command=self._browse_merge_out)
+        merge_out_btn.grid(row=0, column=2, pady=2)
+        path_row.columnconfigure(1, weight=1)
+
+        base_row = ttk.Frame(frame)
+        base_row.grid(row=2, column=0, sticky=tk.EW, pady=(0, 4))
+        make_solid_chk = ttk.Checkbutton(
+            base_row,
+            text="Add printable base",
             variable=self.make_solid_var,
             command=self._update_merge_controls,
         )
-        make_solid_chk.grid(row=2, column=0, sticky=tk.W)
-        self.base_mode_label = ttk.Label(frame, text="Base mode:")
-        self.base_mode_label.grid(row=2, column=1, sticky=tk.W, pady=2)
+        make_solid_chk.grid(row=0, column=0, sticky=tk.W, pady=4)
+
+        self.base_mode_label = ttk.Label(base_row, text="Base mode:")
+        self.base_mode_label.grid(row=0, column=1, sticky=tk.W, padx=(16, 0), pady=2)
         self.base_mode_combo = ttk.Combobox(
-            frame,
+            base_row,
             textvariable=self.base_mode_var,
             values=["fixed", "sealevel"],
             state="readonly",
             width=10,
         )
-        self.base_mode_combo.grid(row=2, column=2, sticky=tk.W)
+        self.base_mode_combo.grid(row=0, column=2, sticky=tk.W, padx=(8, 16))
         self.base_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_merge_controls())
 
-        self.base_thickness_label = ttk.Label(frame, text="Base thickness:")
-        self.base_thickness_label.grid(row=2, column=3, sticky=tk.W, pady=2)
-        self.base_thickness_entry = ttk.Entry(frame, textvariable=self.base_thickness_var, width=10)
-        self.base_thickness_entry.grid(row=2, column=4, sticky=tk.W)
+        self.base_thickness_label = ttk.Label(base_row, text="Fixed base depth (mm):")
+        self.base_thickness_label.grid(row=0, column=3, sticky=tk.W, pady=4)
+        self.base_thickness_entry = ttk.Entry(base_row, textvariable=self.base_thickness_var, width=10)
+        self.base_thickness_entry.grid(row=0, column=4, sticky=tk.W, padx=(8, 16))
+        base_row.columnconfigure(5, weight=1)
 
-        self.base_z_label = ttk.Label(frame, text="Base Z (optional):")
-        self.base_z_label.grid(row=3, column=0, sticky=tk.W, pady=2)
-        self.base_z_entry = ttk.Entry(frame, textvariable=self.base_z_var, width=10)
-        self.base_z_entry.grid(row=3, column=1, sticky=tk.W)
+        clip_row = ttk.Frame(frame)
+        clip_row.grid(row=3, column=0, sticky=tk.EW, pady=(0, 4))
+        self.merge_lake_lower_label = ttk.Label(clip_row, text="Lake lowering (mm):")
+        self.merge_lake_lower_label.grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.merge_lake_lower_entry = ttk.Entry(clip_row, textvariable=self.merge_lake_lower_mm_var, width=10)
+        self.merge_lake_lower_entry.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
 
-        border_mode_label = ttk.Label(frame, text="Border clipping:")
-        border_mode_label.grid(row=4, column=0, sticky=tk.W, pady=2)
+        border_mode_row = ttk.Frame(frame)
+        border_mode_row.grid(row=4, column=0, sticky=tk.EW, pady=(0, 4))
+
+        border_mode_label = ttk.Label(border_mode_row, text="Border clipping:")
+        border_mode_label.grid(row=0, column=2, sticky=tk.W, pady=2)
         border_all_radio = ttk.Radiobutton(
-            frame,
+            border_mode_row,
             text="Merge all tiles",
             value="all",
             variable=self.merge_border_mode_var,
             command=self._update_merge_controls,
         )
-        border_all_radio.grid(row=4, column=1, sticky=tk.W)
+        border_all_radio.grid(row=0, column=3, sticky=tk.W, padx=(8, 12))
         border_clip_radio = ttk.Radiobutton(
-            frame,
-            text="Clip to selected border",
+            border_mode_row,
+            text="Clip to canton/border",
             value="clip",
             variable=self.merge_border_mode_var,
             command=self._update_merge_controls,
         )
-        border_clip_radio.grid(row=4, column=2, sticky=tk.W, padx=(12, 0))
+        border_clip_radio.grid(row=0, column=4, sticky=tk.W)
+        border_mode_row.columnconfigure(5, weight=1)
 
-        self.border_shp_label = ttk.Label(frame, text="Border shapefile:")
-        self.border_shp_label.grid(row=5, column=0, sticky=tk.W, pady=2)
+        border_row = ttk.Frame(frame)
+        border_row.grid(row=5, column=0, sticky=tk.EW, pady=(0, 4))
+        self.border_shp_label = ttk.Label(border_row, text="Border shapefile:")
+        self.border_shp_label.grid(row=0, column=0, sticky=tk.W, pady=2)
         self.border_shp_combo = ttk.Combobox(
-            frame,
+            border_row,
             textvariable=self.border_shp_var,
             values=sorted(self.border_options.keys()),
             state="readonly",
             width=30,
         )
-        self.border_shp_combo.grid(row=5, column=1, columnspan=3, sticky=tk.EW)
+        self.border_shp_combo.grid(row=0, column=1, sticky=tk.EW, padx=(8, 12))
         self.border_shp_combo.bind("<<ComboboxSelected>>", self._on_border_shp_change)
 
-        self.border_scale_label = ttk.Label(frame, text="Border scale:")
-        self.border_scale_label.grid(row=5, column=4, sticky=tk.W, pady=2)
-        self.border_scale_entry = ttk.Entry(frame, textvariable=self.border_scale_var, width=10)
-        self.border_scale_entry.grid(row=5, column=5, sticky=tk.W)
-
-        self.border_keep_label = ttk.Label(frame, text="Keep canton/bezirk:")
-        self.border_keep_label.grid(row=6, column=0, sticky=tk.W, pady=2)
+        self.border_keep_label = ttk.Label(border_row, text="Keep canton/bezirk:")
+        self.border_keep_label.grid(row=0, column=2, sticky=tk.W, pady=2)
         self.border_keep_list = tk.Listbox(
-            frame,
+            border_row,
             selectmode=tk.MULTIPLE,
-            height=6,
+            height=5,
             exportselection=False,
             bg="#0b1220",
             fg="#e2e8f0",
@@ -721,26 +704,53 @@ class App(tk.Tk):
             selectbackground="#2563eb",
             selectforeground="#f8fafc",
         )
-        self.border_keep_list.grid(row=6, column=1, columnspan=3, sticky=tk.EW)
+        self.border_keep_list.grid(row=0, column=3, sticky=tk.EW, padx=(8, 12))
         self.border_keep_list.bind("<MouseWheel>", self._on_listbox_mousewheel)
         self.border_keep_list.bind("<Button-4>", self._on_listbox_mousewheel)
         self.border_keep_list.bind("<Button-5>", self._on_listbox_mousewheel)
         self.border_keep_list.bind("<<ListboxSelect>>", self._on_border_keep_select)
         self.border_keep_refresh_btn = ttk.Button(
-            frame,
+            border_row,
             text="Detect touched",
             command=self._refresh_border_keep_options,
         )
-        self.border_keep_refresh_btn.grid(row=6, column=4, padx=4, pady=2, sticky=tk.W)
+        self.border_keep_refresh_btn.grid(row=0, column=4, pady=2, sticky=tk.NW)
+        border_row.columnconfigure(1, weight=1)
+        border_row.columnconfigure(3, weight=1)
 
-        self.merge_btn = ttk.Button(frame, text="Run Merge", command=self._run_merge)
-        self.merge_btn.grid(row=7, column=5, sticky=tk.E, padx=4, pady=6)
-        self.status_vars["merge"] = tk.StringVar(value=DEFAULTS["status_idle"])
-        self.status_labels["merge"] = ttk.Label(frame, textvariable=self.status_vars["merge"])
-        self.status_labels["merge"].grid(
-            row=7, column=3, sticky=tk.W, padx=(12, 0)
+        merge_summary = ttk.Label(frame, textvariable=self.merge_summary_var)
+        merge_summary.grid(row=6, column=0, sticky=tk.W, pady=(0, 4))
+
+        advanced_toggle = ttk.Checkbutton(
+            frame,
+            text="Show advanced merge settings",
+            variable=self.show_merge_advanced_var,
+            command=self._update_merge_controls,
         )
+        advanced_toggle.grid(row=7, column=0, sticky=tk.W, pady=(4, 4))
+
+        self.merge_advanced_frame = ttk.Frame(frame)
+        self.merge_advanced_frame.grid(row=8, column=0, sticky=tk.EW)
+
+        weld_label = ttk.Label(self.merge_advanced_frame, text="Weld tolerance:")
+        weld_label.grid(row=0, column=0, sticky=tk.W, pady=4)
+        weld_entry = ttk.Entry(self.merge_advanced_frame, textvariable=self.weld_tol_var, width=10)
+        weld_entry.grid(row=0, column=1, sticky=tk.W)
+
+        merge_z_label = ttk.Label(self.merge_advanced_frame, text="Merge Z scale:")
+        merge_z_label.grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
+        merge_z_entry = ttk.Entry(self.merge_advanced_frame, textvariable=self.merge_z_scale_var, width=10)
+        merge_z_entry.grid(row=0, column=3, sticky=tk.W)
+
+        action_row = ttk.Frame(frame)
+        action_row.grid(row=9, column=0, sticky=tk.EW, pady=(6, 0))
+        self.status_vars["merge"] = tk.StringVar(value=DEFAULTS["status_idle"])
+        self.status_labels["merge"] = ttk.Label(action_row, textvariable=self.status_vars["merge"])
+        self.status_labels["merge"].grid(row=0, column=0, sticky=tk.W)
         self.status_labels["merge"].configure(width=12)
+        self.merge_btn = ttk.Button(action_row, text="Build Final STL", command=self._run_merge)
+        self.merge_btn.grid(row=0, column=1, sticky=tk.E)
+        action_row.columnconfigure(0, weight=1)
 
         self.merge_progress = ttk.Progressbar(
             frame,
@@ -749,123 +759,50 @@ class App(tk.Tk):
             mode="determinate",
             length=220,
         )
-        self.merge_progress.grid(row=8, column=1, columnspan=2, sticky=tk.W, pady=(4, 0))
+        self.merge_progress.grid(row=10, column=0, sticky=tk.W, pady=(4, 0))
         self.merge_progress_label = ttk.Label(frame, textvariable=self.merge_progress_label_var)
-        self.merge_progress_label.grid(row=8, column=3, columnspan=3, sticky=tk.W, pady=(4, 0))
+        self.merge_progress_label.grid(row=10, column=0, sticky=tk.E, pady=(4, 0))
         self.merge_progress_label.configure(width=26)
 
-        frame.columnconfigure(1, weight=1)
-        frame.columnconfigure(2, weight=1)
-        frame.columnconfigure(3, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.merge_advanced_frame.columnconfigure(2, weight=1)
 
         self.tooltips += [
             Tooltip(
-                merge_out_label,
-                "Where the merged STL will be saved (--merge-stl).",
-            ),
-            Tooltip(
                 merge_out_entry,
-                "All tiles in ./output/tiles are merged into this file.",
-            ),
-            Tooltip(
-                merge_out_btn,
-                "Choose a filename for the merged STL.",
-            ),
-            Tooltip(
-                weld_label,
-                "Vertices within this distance are welded to remove seams (--weld-tol).",
-            ),
-            Tooltip(
-                weld_entry,
-                "Example: 0.001 is a typical tolerance in map units.",
-            ),
-            Tooltip(
-                merge_z_label,
-                "Scale elevations during merge only (--merge-z-scale).",
-            ),
-            Tooltip(
-                merge_z_entry,
-                "Use to exaggerate or reduce relief on the final model.",
-            ),
-            Tooltip(
-                self.merge_lake_lower_label,
-                "Lower merged lake areas after scaling. The amount is in model millimeters.",
-            ),
-            Tooltip(
-                self.merge_lake_lower_entry,
-                "Example: 1.0 lowers lakes by 1 mm in the final STL. Use 0 to disable.",
+                "The merged terrain STL will be written here.",
             ),
             Tooltip(
                 make_solid_chk,
-                "Adds side walls and a flat base to make the model printable (--make-solid).",
-            ),
-            Tooltip(
-                self.base_mode_label,
-                "Fixed uses base thickness below min terrain. Sealevel uses Z=0 for alignment.",
+                "Adds side walls and a flat base so the result is ready to print.",
             ),
             Tooltip(
                 self.base_mode_combo,
-                "Sealevel helps align multiple prints; fixed adds a base below the terrain.",
-            ),
-            Tooltip(
-                self.base_thickness_label,
-                "Distance below the minimum terrain to place the base (--base-thickness).",
+                "Choose a fixed base depth in millimeters or align the base to sea level (Z=0).",
             ),
             Tooltip(
                 self.base_thickness_entry,
-                "Used only when Make solid is enabled and Base mode is fixed.",
+                "Used when base mode is fixed. Sets how far below the terrain the printable base should sit.",
             ),
             Tooltip(
-                self.base_z_label,
-                "Explicit base plane elevation (--base-z). Overrides base thickness.",
-            ),
-            Tooltip(
-                self.base_z_entry,
-                "Leave blank to use base thickness instead.",
-            ),
-            Tooltip(
-                border_mode_label,
-                "Choose whether to merge all tiles or clip to the selected border.",
-            ),
-            Tooltip(
-                border_all_radio,
-                "Merges all tiles as-is without trimming.",
-            ),
-            Tooltip(
-                border_clip_radio,
-                "Trims triangles outside the selected border geometry.",
-            ),
-            Tooltip(
-                self.border_shp_label,
-                "Select the border dataset from ./geometry_data (country boundary recommended).",
+                self.merge_lake_lower_entry,
+                "Lower detected lake surfaces by this many millimeters in the final model.",
             ),
             Tooltip(
                 self.border_shp_combo,
-                "Uses the selected .shp file for clipping. LANDESGEBIET is the country outline.",
-            ),
-            Tooltip(
-                self.border_scale_label,
-                "Scale factor applied to the border coordinates to match STL units.",
-            ),
-            Tooltip(
-                self.border_scale_entry,
-                "Use 'auto' to reuse the last conversion scale (output/tiles/scale_info.json).",
-            ),
-            Tooltip(
-                self.border_keep_label,
-                "When clipping by canton or bezirk, choose which touched region to keep.",
+                "Choose the Swiss border, canton, or bezirk shapefile used for clipping.",
             ),
             Tooltip(
                 self.border_keep_list,
-                "Select one or more touched regions to keep (Ctrl/Shift to multi-select).",
+                "When using canton or bezirk data, choose which touched regions to keep.",
             ),
             Tooltip(
-                self.border_keep_refresh_btn,
-                "Re-scan tile bounds to update the touched canton/bezirk list.",
+                advanced_toggle,
+                "Show weld tolerance and merge Z scale overrides.",
             ),
             Tooltip(
                 self.merge_btn,
-                "Runs build_stl.py --merge-stl with the selected options.",
+                "Runs build_stl.py --merge-stl with the selected settings.",
             ),
         ]
 
@@ -1226,11 +1163,123 @@ class App(tk.Tk):
         )
         if path:
             self.csv_path_var.set(path)
+            self._refresh_pipeline_summary()
 
     def _load_default_csv(self) -> None:
         csv_files = sorted(self.data_dir.glob("*.csv"))
         if csv_files and not self.csv_path_var.get().strip():
             self.csv_path_var.set(str(csv_files[0]))
+
+    def _count_input_files(self) -> tuple[int, int]:
+        tif_dir = self.data_dir / "tif"
+        xyz_count = len(list(self.xyz_dir.glob("*.xyz")))
+        tif_count = len(list(tif_dir.glob("*.tif"))) + len(list(tif_dir.glob("*.tiff")))
+        tif_count += len(list(self.data_dir.glob("*.tif"))) + len(list(self.data_dir.glob("*.tiff")))
+        return xyz_count, tif_count
+
+    def _count_tiles(self) -> int:
+        return len(list(self.tiles_dir.glob("*.stl")))
+
+    def _refresh_pipeline_summary(self) -> None:
+        if not hasattr(self, "csv_path_var") or not hasattr(self, "merge_out_var"):
+            return
+        csv_path = self.csv_path_var.get().strip()
+        xyz_count, tif_count = self._count_input_files()
+        tile_count = self._count_tiles()
+        final_path = Path(self.merge_out_var.get().strip()) if self.merge_out_var.get().strip() else None
+        final_exists = bool(final_path and final_path.exists())
+
+        ready_parts = []
+        if csv_path:
+            ready_parts.append("CSV selected")
+        if xyz_count or tif_count:
+            ready_parts.append("input tiles ready")
+        if tile_count:
+            ready_parts.append("STL tiles ready")
+        if final_exists:
+            ready_parts.append("final STL exists")
+        self.pipeline_status_var.set(" -> ".join(ready_parts) if ready_parts else "Pick a CSV or place tiles into data/.")
+
+        csv_name = Path(csv_path).name if csv_path else "no CSV selected"
+        self.input_summary_var.set(f"{csv_name} | {xyz_count} XYZ, {tif_count} TIF")
+        self.tiles_summary_var.set(f"{tile_count} tile STL files in output/tiles")
+        self.output_summary_var.set(final_path.name if final_exists and final_path else "not built yet")
+        self.detail_summary_var.set(self._detail_summary_text())
+        self.merge_summary_var.set(self._merge_summary_text())
+
+    def _detail_summary_text(self) -> str:
+        preset = self.detail_preset_var.get().strip()
+        if preset == "draft":
+            return "Fastest export with lighter meshes."
+        if preset == "fine":
+            return "Higher detail and larger STL output."
+        if preset == "custom":
+            return "Custom mode uses your advanced conversion settings."
+        return "Balanced for typical 3D print workflows."
+
+    def _merge_summary_text(self) -> str:
+        if self.make_solid_var.get():
+            return f"Printable base enabled, thickness {self.base_thickness_var.get().strip() or '5.0'} mm."
+        return "Surface-only merge, no printable base."
+
+    def _apply_detail_preset(self) -> None:
+        preset = self.detail_preset_var.get().strip()
+        if preset == "draft":
+            self.mode_var.set("auto")
+            self.scale_mode_var.set("target_size")
+            self.target_res_var.set("0.8")
+        elif preset == "fine":
+            self.mode_var.set("auto")
+            self.scale_mode_var.set("target_size")
+            self.target_res_var.set("0.2")
+        elif preset == "balanced":
+            self.mode_var.set("auto")
+            self.scale_mode_var.set("target_size")
+            self.target_res_var.set("0.3")
+
+    def _queue_pipeline_commands(self, commands: list[tuple[list[str], str, str]]) -> None:
+        if self.current_process is not None:
+            messagebox.showinfo("Busy", "Another task is running.")
+            return
+        if not commands:
+            return
+        self.pending_commands = list(commands)
+        self.pipeline_running = True
+        self._start_next_command()
+
+    def _start_next_command(self) -> None:
+        if not self.pending_commands:
+            self.pipeline_running = False
+            self._refresh_pipeline_summary()
+            return
+        args, label, status_key = self.pending_commands.pop(0)
+        self._run_command(args, label, status_key)
+
+    def _run_full_pipeline(self) -> None:
+        commands: list[tuple[list[str], str, str]] = []
+        csv_path = self.csv_path_var.get().strip()
+        xyz_count, tif_count = self._count_input_files()
+        if csv_path:
+            download_args = self._build_download_args()
+            if download_args is None:
+                return
+            commands.append((download_args, "Download tiles", "download"))
+        elif not (xyz_count or tif_count):
+            messagebox.showwarning(
+                "Missing input",
+                "Select a CSV to download tiles, or place XYZ/TIF tiles into data/ before running the full pipeline.",
+            )
+            return
+
+        convert_args = self._build_convert_args()
+        if convert_args is None:
+            return
+        merge_args = self._build_merge_args()
+        if merge_args is None:
+            return
+        commands.append((convert_args, "Convert tiles", "convert"))
+        commands.append((merge_args, "Merge tiles", "merge"))
+        self._queue_pipeline_commands(commands)
 
     def _copy_csv(self) -> None:
         src = self.csv_path_var.get().strip()
@@ -1248,6 +1297,7 @@ class App(tk.Tk):
         shutil.copy2(src_path, dest)
         self.csv_path_var.set(str(dest))
         self._log(f"Copied CSV to {dest}")
+        self._refresh_pipeline_summary()
 
     def _browse_merge_out(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -1259,10 +1309,9 @@ class App(tk.Tk):
         if path:
             self.merge_out_var.set(path)
             self._auto_merge_out = path
+            self._refresh_pipeline_summary()
 
-    def _run_download(self) -> None:
-        self.download_progress_var.set(0.0)
-        self.download_progress_label_var.set("")
+    def _build_download_args(self) -> list[str] | None:
         args = [sys.executable, "download_tiles.py"]
         csv_path = self.csv_path_var.get().strip()
         if csv_path:
@@ -1282,12 +1331,11 @@ class App(tk.Tk):
             ):
                 args.append("--clean-xyz")
 
-        self._run_command(args, "Download tiles", status_key="download")
+        return args
 
-    def _run_convert(self) -> None:
-        self.convert_progress_var.set(0.0)
-        self.convert_progress_label_var.set("")
+    def _build_convert_args(self) -> list[str] | None:
         args = [sys.executable, "build_stl.py", "--all"]
+        self._apply_detail_preset()
 
         existing_tiles = []
         if self.tiles_dir.exists():
@@ -1349,15 +1397,13 @@ class App(tk.Tk):
         if model_name:
             args += ["--model-name", model_name]
 
-        self._run_command(args, "Convert tiles", status_key="convert")
+        return args
 
-    def _run_merge(self) -> None:
-        self.merge_progress_var.set(0.0)
-        self.merge_progress_label_var.set("")
+    def _build_merge_args(self) -> list[str] | None:
         out_path = self.merge_out_var.get().strip()
         if not out_path:
             messagebox.showwarning("Missing output", "Please choose an output STL path.")
-            return
+            return None
 
         out_parent = Path(out_path).resolve().parent
         out_parent.mkdir(parents=True, exist_ok=True)
@@ -1384,22 +1430,16 @@ class App(tk.Tk):
             base_thick = self.base_thickness_var.get().strip()
             if base_thick:
                 args += ["--base-thickness", base_thick]
-            base_z = self.base_z_var.get().strip()
-            if base_z:
-                args += ["--base-z", base_z]
 
         if self.merge_border_mode_var.get() == "clip":
             if not self.border_options:
                 messagebox.showerror("Missing borders", "No border shapefiles found in ./geometry_data.")
-                return
+                return None
             args.append("--clip-border")
             border_label = self.border_shp_var.get().strip()
             if border_label:
                 border_path = self.border_options.get(border_label, Path(border_label))
                 args += ["--border-shp", str(border_path)]
-            border_scale = self.border_scale_var.get().strip()
-            if border_scale:
-                args += ["--border-scale", border_scale]
             if border_label:
                 border_path = self.border_options.get(border_label, Path(border_label))
                 border_type = self._border_type_from_path(border_path)
@@ -1413,6 +1453,30 @@ class App(tk.Tk):
         if model_name:
             args += ["--model-name", model_name]
 
+        return args
+
+    def _run_download(self) -> None:
+        self.download_progress_var.set(0.0)
+        self.download_progress_label_var.set("")
+        args = self._build_download_args()
+        if args is None:
+            return
+        self._run_command(args, "Download tiles", status_key="download")
+
+    def _run_convert(self) -> None:
+        self.convert_progress_var.set(0.0)
+        self.convert_progress_label_var.set("")
+        args = self._build_convert_args()
+        if args is None:
+            return
+        self._run_command(args, "Convert tiles", status_key="convert")
+
+    def _run_merge(self) -> None:
+        self.merge_progress_var.set(0.0)
+        self.merge_progress_label_var.set("")
+        args = self._build_merge_args()
+        if args is None:
+            return
         self._run_command(args, "Merge tiles", status_key="merge")
 
     def _on_model_name_change(self, _event: tk.Event) -> None:
@@ -1423,6 +1487,7 @@ class App(tk.Tk):
         if self.merge_out_var.get().strip() in {"", self._auto_merge_out}:
             self.merge_out_var.set(auto_path)
             self._auto_merge_out = auto_path
+        self._refresh_pipeline_summary()
 
     def _run_command(self, args: list[str], label: str, status_key: str) -> None:
         if self.current_process is not None:
@@ -1511,9 +1576,18 @@ class App(tk.Tk):
             subprocess.Popen(["xdg-open", str(self.output_dir.resolve())])
 
     def _update_convert_mode(self) -> None:
-        if self.mode_var.get() != "auto" and self.scale_mode_var.get() == "target_size":
+        if self.detail_preset_var.get().strip() != "custom":
+            self.mode_var.set("auto")
+            self.scale_mode_var.set("target_size")
+        elif self.mode_var.get() != "auto" and self.scale_mode_var.get() == "target_size":
             self.scale_mode_var.set("tile_size")
         self._update_scale_mode()
+        self.detail_summary_var.set(self._detail_summary_text())
+        if self.show_convert_advanced_var.get() or self.detail_preset_var.get().strip() == "custom":
+            self.convert_advanced_frame.grid()
+        else:
+            self.convert_advanced_frame.grid_remove()
+        self._refresh_pipeline_summary()
 
     def _update_scale_mode(self) -> None:
         auto_mode = self.mode_var.get() == "auto"
@@ -1555,8 +1629,6 @@ class App(tk.Tk):
 
         if make_solid:
             self.base_mode_combo.configure(state="readonly")
-            self.base_z_entry.configure(state="normal")
-            self.base_z_label.configure(foreground="#e2e8f0")
             self.base_mode_label.configure(foreground="#e2e8f0")
             if base_mode == "sealevel":
                 self.base_thickness_entry.configure(state="disabled")
@@ -1567,19 +1639,20 @@ class App(tk.Tk):
         else:
             self.base_mode_combo.configure(state="disabled")
             self.base_thickness_entry.configure(state="disabled")
-            self.base_z_entry.configure(state="disabled")
             self.base_mode_label.configure(foreground="#6b7280")
             self.base_thickness_label.configure(foreground="#6b7280")
-            self.base_z_label.configure(foreground="#6b7280")
+
+        if self.show_merge_advanced_var.get():
+            self.merge_advanced_frame.grid()
+        else:
+            self.merge_advanced_frame.grid_remove()
 
         if not border_available:
             self.merge_border_mode_var.set("all")
             clip_border = False
 
         self.border_shp_combo.configure(state="readonly" if clip_border else "disabled")
-        self.border_scale_entry.configure(state="normal" if clip_border else "disabled")
         self.border_shp_label.configure(foreground="#e2e8f0" if clip_border else "#6b7280")
-        self.border_scale_label.configure(foreground="#e2e8f0" if clip_border else "#6b7280")
         self.border_keep_list.configure(state="normal" if border_keep_enabled else "disabled")
         self.border_keep_refresh_btn.configure(state="normal" if border_keep_enabled else "disabled")
         self.border_keep_label.configure(foreground="#e2e8f0" if border_keep_enabled else "#6b7280")
@@ -1588,6 +1661,8 @@ class App(tk.Tk):
             self.border_keep_list.delete(0, tk.END)
         elif not self.border_keep_options:
             self._refresh_border_keep_options()
+        self.merge_summary_var.set(self._merge_summary_text())
+        self._refresh_pipeline_summary()
 
     def _set_status(self, key: str, text: str, color: str) -> None:
         var = self.status_vars.get(key)
@@ -1602,6 +1677,13 @@ class App(tk.Tk):
             self._set_status(key, "Success", "#22c55e")
         else:
             self._set_status(key, "Failed", "#ef4444")
+        self._refresh_pipeline_summary()
+        if self.pipeline_running:
+            if exit_code == 0:
+                self._start_next_command()
+            else:
+                self.pending_commands = []
+                self.pipeline_running = False
 
 
 if __name__ == "__main__":
