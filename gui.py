@@ -12,6 +12,9 @@ from tkinter import filedialog, messagebox, ttk
 from defaults import DEFAULTS
 
 
+GEOMETRY_DATA_DIRNAME = "geometry_data"
+
+
 class Tooltip:
     def __init__(self, widget: tk.Widget, text: str) -> None:
         self.widget = widget
@@ -77,7 +80,7 @@ class App(tk.Tk):
         self.xyz_dir = self.data_dir / "xyz"
         self.output_dir = Path(__file__).resolve().parent / "output"
         self.tiles_dir = self.output_dir / "tiles"
-        self.borders_dir = Path(__file__).resolve().parent / "borders"
+        self.geometry_data_dir = Path(__file__).resolve().parent / GEOMETRY_DATA_DIRNAME
 
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.xyz_dir.mkdir(parents=True, exist_ok=True)
@@ -612,6 +615,7 @@ class App(tk.Tk):
         self.merge_out_var = tk.StringVar(value=self._auto_merge_out)
         self.weld_tol_var = tk.StringVar(value=DEFAULTS["weld_tolerance"])
         self.merge_z_scale_var = tk.StringVar(value=DEFAULTS["merge_z_scale"])
+        self.merge_lake_lower_mm_var = tk.StringVar(value=DEFAULTS["merge_lake_lower_mm"])
         self.make_solid_var = tk.BooleanVar(value=DEFAULTS["make_solid"])
         self.base_mode_var = tk.StringVar(value=DEFAULTS["base_mode"])
         self.base_thickness_var = tk.StringVar(value=DEFAULTS["base_thickness"])
@@ -632,6 +636,11 @@ class App(tk.Tk):
         merge_z_label.grid(row=1, column=2, sticky=tk.W, padx=(12, 0))
         merge_z_entry = ttk.Entry(frame, textvariable=self.merge_z_scale_var, width=10)
         merge_z_entry.grid(row=1, column=3, sticky=tk.W)
+
+        self.merge_lake_lower_label = ttk.Label(frame, text="Lake lowering (mm):")
+        self.merge_lake_lower_label.grid(row=1, column=4, sticky=tk.W, padx=(12, 0))
+        self.merge_lake_lower_entry = ttk.Entry(frame, textvariable=self.merge_lake_lower_mm_var, width=10)
+        self.merge_lake_lower_entry.grid(row=1, column=5, sticky=tk.W)
 
         make_solid_chk = ttk.Checkbutton(
             frame,
@@ -779,6 +788,14 @@ class App(tk.Tk):
                 "Use to exaggerate or reduce relief on the final model.",
             ),
             Tooltip(
+                self.merge_lake_lower_label,
+                "Lower merged lake areas after scaling. The amount is in model millimeters.",
+            ),
+            Tooltip(
+                self.merge_lake_lower_entry,
+                "Example: 1.0 lowers lakes by 1 mm in the final STL. Use 0 to disable.",
+            ),
+            Tooltip(
                 make_solid_chk,
                 "Adds side walls and a flat base to make the model printable (--make-solid).",
             ),
@@ -820,7 +837,7 @@ class App(tk.Tk):
             ),
             Tooltip(
                 self.border_shp_label,
-                "Select the border dataset from ./borders (country boundary recommended).",
+                "Select the border dataset from ./geometry_data (country boundary recommended).",
             ),
             Tooltip(
                 self.border_shp_combo,
@@ -860,17 +877,34 @@ class App(tk.Tk):
             return path.name
         return name.title()
 
+    def _geometry_search_roots(self) -> list[Path]:
+        roots = [self.geometry_data_dir, Path(__file__).resolve().parent / "borders"]
+        seen: set[str] = set()
+        unique: list[Path] = []
+        for path in roots:
+            key = str(path.resolve()) if path.exists() else str(path)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(path)
+        return unique
+
+    def _is_border_shapefile(self, path: Path) -> bool:
+        name = path.name.upper()
+        return any(token in name for token in ("LANDES", "KANTON", "BEZIRK"))
+
     def _discover_border_shp(self) -> dict[str, Path]:
         options: dict[str, Path] = {}
-        if not self.borders_dir.exists():
-            return options
-        for shp in sorted(self.borders_dir.rglob("*.shp")):
-            if not shp.is_file():
+        for root in self._geometry_search_roots():
+            if not root.exists():
                 continue
-            label = self._format_border_label(shp)
-            if label in options:
-                label = f"{label} ({shp.name})"
-            options[label] = shp
+            for shp in sorted(root.rglob("*.shp")):
+                if not shp.is_file() or not self._is_border_shapefile(shp):
+                    continue
+                label = self._format_border_label(shp)
+                if label in options:
+                    label = f"{label} ({shp.name})"
+                options[label] = shp
         return options
 
     def _select_default_border_label(self) -> str:
@@ -1338,6 +1372,10 @@ class App(tk.Tk):
         if merge_z:
             args += ["--merge-z-scale", merge_z]
 
+        lake_lower_mm = self.merge_lake_lower_mm_var.get().strip()
+        if lake_lower_mm:
+            args += ["--lake-lower-mm", lake_lower_mm]
+
         if self.make_solid_var.get():
             args.append("--make-solid")
             base_mode = self.base_mode_var.get().strip()
@@ -1352,7 +1390,7 @@ class App(tk.Tk):
 
         if self.merge_border_mode_var.get() == "clip":
             if not self.border_options:
-                messagebox.showerror("Missing borders", "No border shapefiles found in ./borders.")
+                messagebox.showerror("Missing borders", "No border shapefiles found in ./geometry_data.")
                 return
             args.append("--clip-border")
             border_label = self.border_shp_var.get().strip()
