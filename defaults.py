@@ -18,6 +18,7 @@ DEFAULTS = {
     "merge_out": "output/terrain.stl",
     "weld_tolerance": "0.01",
     "merge_z_scale": "1.0",
+    "merge_lake_lower_mm": "0.0",
     "make_solid": True,
     "base_thickness": "5.0",
     "base_z": "",

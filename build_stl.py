@@ -42,6 +42,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
+GEOMETRY_DATA_DIRNAME = "geometry_data"
+
+
 @dataclass(frozen=True)
 class Mesh:
     vertices: np.ndarray  # (N, 3) float64
@@ -1201,15 +1204,49 @@ def _read_last_scale_info(path: Path) -> Optional[float]:
         return None
 
 
+def _geometry_search_roots() -> List[Path]:
+    base = Path(__file__).resolve().parent
+    roots = [base / GEOMETRY_DATA_DIRNAME, base / "borders"]
+    seen = set()
+    unique: List[Path] = []
+    for path in roots:
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    return unique
+
+
+def _is_border_shapefile(path: Path) -> bool:
+    name = path.name.upper()
+    return any(token in name for token in ("LANDES", "KANTON", "BEZIRK"))
+
+
+def _is_lake_shapefile(path: Path) -> bool:
+    name = path.name.upper()
+    return "GEWAESSER" in name and "STEHENDES" in name
+
+
 def _default_border_shp() -> Optional[Path]:
-    borders_dir = Path(__file__).resolve().parent / "borders"
-    if not borders_dir.exists():
-        return None
-    shp_files = [p for p in borders_dir.rglob("*.shp") if p.is_file()]
+    shp_files: List[Path] = []
+    for root in _geometry_search_roots():
+        if root.exists():
+            shp_files.extend(p for p in root.rglob("*.shp") if p.is_file() and _is_border_shapefile(p))
     if not shp_files:
         return None
-    preferred = [p for p in shp_files if "LANDESGEBIET" in p.name.upper()]
+    preferred = [p for p in shp_files if any(token in p.name.upper() for token in ("LANDESGRENZE", "LANDESGEBIET"))]
     return sorted(preferred or shp_files)[0]
+
+
+def _default_lake_shp() -> Optional[Path]:
+    shp_files: List[Path] = []
+    for root in _geometry_search_roots():
+        if root.exists():
+            shp_files.extend(p for p in root.rglob("*.shp") if p.is_file() and _is_lake_shapefile(p))
+    if not shp_files:
+        return None
+    return sorted(shp_files)[0]
 
 
 def _parse_border_scale(raw: str, tiles_dir: Path) -> float:
@@ -1361,6 +1398,290 @@ def _scale_border_geometry(geom, scale: float):
     return shapely_scale(geom, xfact=scale, yfact=scale, origin=(0.0, 0.0))
 
 
+def _bounds_intersect(
+    a_min_x: float,
+    a_min_y: float,
+    a_max_x: float,
+    a_max_y: float,
+    b_min_x: float,
+    b_min_y: float,
+    b_max_x: float,
+    b_max_y: float,
+) -> bool:
+    return not (
+        a_max_x < b_min_x or
+        a_min_x > b_max_x or
+        a_max_y < b_min_y or
+        a_min_y > b_max_y
+    )
+
+
+def _lake_shape_parts(shape_obj) -> Tuple[List[object], List[object]]:
+    try:
+        from shapely.geometry import LineString, shape as shapely_shape
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Lake lowering requires 'shapely'. Install with: pip install shapely"
+        ) from exc
+
+    shape_type = int(getattr(shape_obj, "shapeType", 0))
+    if shape_type in {5, 15, 25, 31}:  # Polygon / PolygonZ / PolygonM / MultiPatch-ish polygonal records
+        geom = shapely_shape(shape_obj.__geo_interface__)
+        if geom.is_empty:
+            return ([], [])
+        if geom.geom_type == "Polygon":
+            return ([geom], [])
+        if geom.geom_type == "MultiPolygon":
+            return ([g for g in geom.geoms if not g.is_empty], [])
+        return ([], [])
+
+    if shape_type not in {3, 13, 23}:  # PolyLine / PolyLineZ / PolyLineM
+        return ([], [])
+
+    points = list(getattr(shape_obj, "points", []) or [])
+    if not points:
+        return ([], [])
+    parts = list(getattr(shape_obj, "parts", []) or [0])
+    if not parts:
+        parts = [0]
+    parts = parts + [len(points)]
+
+    lines: List[object] = []
+    for start, end in zip(parts, parts[1:]):
+        segment = [(float(pt[0]), float(pt[1])) for pt in points[start:end]]
+        if len(segment) < 2:
+            continue
+        line = LineString(segment)
+        if line.is_empty or line.length <= 0.0:
+            continue
+        lines.append(line)
+    return ([], lines)
+
+
+def _load_lake_geometries_for_bounds(
+    shp_path: Path,
+    *,
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+):
+    try:
+        import shapefile  # pyshp
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Lake lowering requires 'pyshp' and 'shapely'. "
+            "Install with: pip install pyshp shapely"
+        ) from exc
+
+    if not shp_path.exists():
+        raise FileNotFoundError(f"Lake shapefile not found: {shp_path}")
+
+    reader = shapefile.Reader(str(shp_path))
+    geoms = []
+    lines = []
+    for shape_record in reader.iterShapeRecords():
+        shape_bbox = getattr(shape_record.shape, "bbox", None)
+        if shape_bbox and len(shape_bbox) >= 4:
+            if not _bounds_intersect(
+                float(shape_bbox[0]),
+                float(shape_bbox[1]),
+                float(shape_bbox[2]),
+                float(shape_bbox[3]),
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            ):
+                continue
+        shape_polys, shape_lines = _lake_shape_parts(shape_record.shape)
+        lines.extend(shape_lines)
+        for geom in shape_polys:
+            geom_bounds = geom.bounds
+            if not _bounds_intersect(
+                float(geom_bounds[0]),
+                float(geom_bounds[1]),
+                float(geom_bounds[2]),
+                float(geom_bounds[3]),
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            ):
+                continue
+            geoms.append(geom)
+    if geoms or not lines:
+        return geoms
+
+    try:
+        from shapely.ops import polygonize, unary_union
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Lake lowering requires 'shapely'. Install with: pip install shapely"
+        ) from exc
+
+    merged_lines = unary_union(lines)
+    for geom in polygonize(merged_lines):
+        geom_bounds = geom.bounds
+        if not _bounds_intersect(
+            float(geom_bounds[0]),
+            float(geom_bounds[1]),
+            float(geom_bounds[2]),
+            float(geom_bounds[3]),
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        ):
+            continue
+        geoms.append(geom)
+    return geoms
+
+
+def _load_all_lake_geometries(shp_path: Path):
+    try:
+        import shapefile  # pyshp
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Lake lowering requires 'pyshp' and 'shapely'. "
+            "Install with: pip install pyshp shapely"
+        ) from exc
+
+    if not shp_path.exists():
+        raise FileNotFoundError(f"Lake shapefile not found: {shp_path}")
+
+    reader = shapefile.Reader(str(shp_path))
+    geoms = []
+    lines = []
+    for shape_record in reader.iterShapeRecords():
+        shape_polys, shape_lines = _lake_shape_parts(shape_record.shape)
+        geoms.extend(shape_polys)
+        lines.extend(shape_lines)
+    if geoms or not lines:
+        return geoms
+
+    try:
+        from shapely.ops import polygonize, unary_union
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Lake lowering requires 'shapely'. Install with: pip install shapely"
+        ) from exc
+
+    merged_lines = unary_union(lines)
+    geoms.extend(list(polygonize(merged_lines)))
+    return geoms
+
+
+def _geometry_xy_mask(geom, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    flat_x = np.asarray(xs, dtype=np.float64).ravel()
+    flat_y = np.asarray(ys, dtype=np.float64).ravel()
+    mask = np.zeros(flat_x.shape[0], dtype=bool)
+
+    try:
+        from shapely import intersects_xy as shapely_intersects_xy  # type: ignore
+    except Exception:
+        shapely_intersects_xy = None
+
+    if shapely_intersects_xy is not None:
+        chunk_size = 500_000
+        for start in range(0, flat_x.shape[0], chunk_size):
+            end = min(start + chunk_size, flat_x.shape[0])
+            mask[start:end] = np.asarray(
+                shapely_intersects_xy(geom, flat_x[start:end], flat_y[start:end]),
+                dtype=bool,
+            )
+        return mask.reshape(np.shape(xs))
+
+    try:
+        from shapely.geometry import Point
+        from shapely.prepared import prep
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Lake lowering requires 'shapely'. Install with: pip install shapely"
+        ) from exc
+
+    prepared = prep(geom)
+    for idx, (x, y) in enumerate(zip(flat_x, flat_y)):
+        mask[idx] = prepared.covers(Point(float(x), float(y)))
+    return mask.reshape(np.shape(xs))
+
+
+def _apply_lake_lowering_to_mesh(mesh: Mesh, lake_shp: Path, *, lake_scale: float, amount_mm: float) -> Mesh:
+    if amount_mm <= 0.0:
+        return mesh
+    if lake_scale <= 0.0:
+        raise ValueError("Lake scale must be > 0.")
+
+    vertices = mesh.vertices
+    model_min_x = float(vertices[:, 0].min())
+    model_max_x = float(vertices[:, 0].max())
+    model_min_y = float(vertices[:, 1].min())
+    model_max_y = float(vertices[:, 1].max())
+
+    lake_geoms = _load_all_lake_geometries(lake_shp)
+    if not lake_geoms:
+        print("[LAKES] No lake polygons found in the lake dataset.")
+        return mesh
+
+    scales_to_try: List[float] = [float(lake_scale)]
+    if abs(float(lake_scale) - 1.0) > 1e-12:
+        scales_to_try.append(1.0)
+
+    for scale_try in scales_to_try:
+        tested_mask = np.zeros(vertices.shape[0], dtype=bool)
+        lowered_mask = np.zeros(vertices.shape[0], dtype=bool)
+        intersecting_feature_count = 0
+
+        for geom in lake_geoms:
+            geom_scaled = _scale_border_geometry(geom, scale_try) if scale_try != 1.0 else geom
+            bounds = geom_scaled.bounds
+            if not _bounds_intersect(
+                float(bounds[0]),
+                float(bounds[1]),
+                float(bounds[2]),
+                float(bounds[3]),
+                model_min_x,
+                model_min_y,
+                model_max_x,
+                model_max_y,
+            ):
+                continue
+
+            intersecting_feature_count += 1
+            bbox_mask = (
+                (vertices[:, 0] >= bounds[0]) &
+                (vertices[:, 0] <= bounds[2]) &
+                (vertices[:, 1] >= bounds[1]) &
+                (vertices[:, 1] <= bounds[3])
+            )
+            candidate_idx = np.flatnonzero(bbox_mask)
+            if candidate_idx.size == 0:
+                continue
+            tested_mask[candidate_idx] = True
+            local_mask = _geometry_xy_mask(geom_scaled, vertices[candidate_idx, 0], vertices[candidate_idx, 1])
+            if np.any(local_mask):
+                lowered_mask[candidate_idx[local_mask]] = True
+
+        tested_count = int(tested_mask.sum())
+        lowered_count = int(lowered_mask.sum())
+        if lowered_count > 0:
+            out_vertices = vertices.copy()
+            out_vertices[lowered_mask, 2] -= float(amount_mm)
+            if scale_try != float(lake_scale):
+                print(
+                    f"[LAKES] Stored scale {float(lake_scale):.6f} found no lake hits; "
+                    f"used fallback XY scale {scale_try:.6f}"
+                )
+            print(
+                f"[LAKES] Lowered {lowered_count:,} merged vertex/vertices by {float(amount_mm):.3f} mm "
+                f"(tested {tested_count:,}/{vertices.shape[0]:,}, features {intersecting_feature_count:,})"
+            )
+            return Mesh(vertices=out_vertices, faces=mesh.faces)
+
+    print("[LAKES] No lake polygons intersect the merged model bounds.")
+    return mesh
+
+
 def _interp_z_from_triangle(
     a: Tuple[float, float, float],
     b: Tuple[float, float, float],
@@ -1456,6 +1777,9 @@ def merge_stls_mesh(
     base_z_value: Optional[float],
     base_mode: str,
     z_scale: float,
+    lake_lower_mm: float = 0.0,
+    lake_shp: Optional[Path] = None,
+    lake_scale: float = 1.0,
     clip_border: bool = False,
     border_geom=None,
 ) -> None:
@@ -1558,6 +1882,15 @@ def merge_stls_mesh(
     if z_scale != 1.0:
         merged = scale_mesh_z(merged, float(z_scale))
 
+    if lake_shp is not None and float(lake_lower_mm) > 0.0:
+        print(f"[LAKES] Applying merged lake lowering: {float(lake_lower_mm):.3f} mm")
+        merged = _apply_lake_lowering_to_mesh(
+            merged,
+            lake_shp,
+            lake_scale=float(lake_scale),
+            amount_mm=float(lake_lower_mm),
+        )
+
     if make_solid_flag:
         if base_z_value is not None:
             base_z = float(base_z_value)
@@ -1602,7 +1935,7 @@ def main() -> None:
         "--border-shp",
         type=Path,
         default=None,
-        help="Path to a Swiss border .shp file (default: auto-detect from ./borders).",
+        help="Path to a Swiss border .shp file (default: auto-detect from ./geometry_data).",
     )
     ap.add_argument(
         "--border-scale",
@@ -1636,6 +1969,18 @@ def main() -> None:
         type=float,
         default=1.0,
         help="Multiply Z by this factor (default: 1.0)",
+    )
+    ap.add_argument(
+        "--lake-lower-mm",
+        type=float,
+        default=0.0,
+        help="Lower merged lake surfaces by this amount in final STL units (mm). Requires --merge-stl.",
+    )
+    ap.add_argument(
+        "--lake-shp",
+        type=Path,
+        default=None,
+        help="Path to a lake polygon .shp file used during merge (default: auto-detect standing water in ./geometry_data).",
     )
     ap.add_argument(
         "--merge-z-scale",
@@ -1752,12 +2097,17 @@ def main() -> None:
     if scale_mode_count > 1:
         ap.error("Use only one of --target-size-mm, --tile-size-mm, or --scale-ratio.")
 
+    if float(args.lake_lower_mm) > 0.0 and args.merge_stl is None:
+        ap.error("--lake-lower-mm can only be used with --merge-stl.")
+
     if args.merge_stl is not None:
         border_geom = None
+        lake_shp = None
+        lake_scale = 1.0
         if args.clip_border:
             border_path = args.border_shp or _default_border_shp()
             if border_path is None:
-                ap.error("--clip-border requested but no border shapefile was found in ./borders.")
+                ap.error("--clip-border requested but no border shapefile was found in ./geometry_data.")
             border_scale = _parse_border_scale(str(args.border_scale), Path("./output/tiles"))
             print(f"[BORDER] Loading border from {border_path}")
             keep_values = _parse_border_keep_list(str(args.border_keep))
@@ -1773,6 +2123,14 @@ def main() -> None:
                 print(f"[BORDER] Scaling border by {border_scale:.6f}")
                 border_geom = _scale_border_geometry(border_geom, float(border_scale))
 
+        if float(args.lake_lower_mm) > 0.0:
+            lake_shp = args.lake_shp or _default_lake_shp()
+            if lake_shp is None:
+                ap.error("--lake-lower-mm requested but no standing-water shapefile was found in ./geometry_data.")
+            lake_scale = _parse_border_scale("auto", Path("./output/tiles"))
+            print(f"[LAKES] Using lake polygons from {lake_shp}")
+            print(f"[LAKES] Using XY scale {lake_scale:.6f} for merged lake matching")
+
         # Load + weld for seamless joins; solidify once globally if requested.
         merge_name = args.model_name.strip() or "terrain_merged"
         merge_stls_mesh(
@@ -1785,6 +2143,9 @@ def main() -> None:
             base_z_value=args.base_z,
             base_mode=str(args.base_mode),
             z_scale=float(args.merge_z_scale),
+            lake_lower_mm=float(args.lake_lower_mm),
+            lake_shp=lake_shp,
+            lake_scale=float(lake_scale),
             clip_border=bool(args.clip_border),
             border_geom=border_geom,
         )

@@ -64,7 +64,7 @@ Optional (only needed for GeoTIFF / COG input):
 py -3 -m pip install rasterio
 ```
 
-Optional (only needed for Swiss border clipping):
+Optional (needed for Swiss border clipping and lake lowering):
 ```bash
 py -3 -m pip install shapely pyshp
 ```
@@ -153,12 +153,15 @@ This step merges all tiles in `output/tiles` into a single STL and optionally ad
 - **Output STL path**: Where the final STL should be saved.
 - **Weld tolerance**: Removes tile seams by welding nearby vertices (example: `0.001` or `0.01`).
 - **Merge Z scale**: Z scaling applied during merge only.
+- **Lake lowering (mm)**: Lowers merged lake surfaces by a user-defined amount in model millimeters after scaling.
+  - Uses the standing-water shapefile auto-detected from `./geometry_data`.
+  - Set to `0` to disable.
 - **Make solid**: Adds side walls and a flat base for printing.
   - **Base thickness**: Base thickness below the minimum elevation.
   - **Base Z (optional)**: Explicit base elevation (overrides thickness).
 - **Border clipping**: Choose whether to merge all tiles or clip to a Swiss border shapefile.
   - **Clip to Swiss border**: Trims triangles outside the selected border geometry.
-  - **Border shapefile**: Pick a `.shp` from `./borders` (Landesgrenze is the country outline).
+  - **Border shapefile**: Pick a `.shp` from `./geometry_data` (Landesgrenze is the country outline).
   - **Border scale**: Scale factor for border coordinates. Use `auto` to reuse the tile scale stored in `output/tiles/scale_info.json` (falls back to `1.0`).
   - **Keep canton/bezirk**: Click **Detect touched** to list only regions intersecting the current tiles, then multi-select which to keep (Ctrl/Shift).
     - Works with canton/bezirk datasets and requires `pyshp` + `shapely` installed.
@@ -185,10 +188,14 @@ project/
       tile_002.stl
       tile_003.stl
     terrain.stl
-  borders/
-    LANDESGEBIET.shp
-    LANDESGEBIET.shx
-    LANDESGEBIET.dbf
+  geometry_data/
+    swissboundaries.../
+      LANDESGRENZE.shp
+      KANTONSGRENZE.shp
+      BEZIRKSGRENZE.shp
+    swisstlm3d.../
+      TLM_GEWAESSER/
+        swissTLM3D_TLM_STEHENDES_GEWAESSER.shp
 ```
 
 ---
@@ -201,8 +208,9 @@ Everything the GUI does is available via CLI if you prefer:
 python download_tiles.py --csv path/to/urls.csv
 python build_stl.py --all --target-size-mm 150
 python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001 --make-solid
-python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp borders/LANDESGEBIET.shp --border-scale auto
-python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp borders/KANTONSGRENZE.shp --border-keep "Bern,Uri"
+python build_stl.py --merge-stl output/terrain.stl --lake-lower-mm 1.2
+python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp geometry_data/swissboundaries.../LANDESGRENZE.shp --border-scale auto
+python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp geometry_data/swissboundaries.../KANTONSGRENZE.shp --border-keep "Bern,Uri"
 ```
 
 ---
