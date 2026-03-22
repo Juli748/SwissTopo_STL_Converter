@@ -1,148 +1,283 @@
-# SwissTopo STL Converter
+# SwissTopo STL Converter (GUI-first)
 
-This project is now GUI-first and optimized around a simple path:
+## Get the SwissTopo CSV (first step)
 
-1. Select a SwissTopo CSV or place terrain tiles into `data/`
-2. Choose the final model size and a detail preset
-3. Click `Run Full Pipeline`
+Download the CSV of swissALTI3D tiles from SwissTopo and place it into `data/` (recommended). The GUI can also browse to the CSV anywhere on disk and optionally copy it into `data/`.
 
-The app can still handle advanced border clipping, lake lowering, scale overrides, and manual downsampling, but those settings are hidden by default.
+1. Open the swissALTI3D page and select the tiles you want.
+2. Export or download the CSV from the selection.
+3. Save the CSV into `data/` so the GUI picks it up automatically, or browse to it directly from the app.
 
-## Start
+![SwissTopo selection](images/selection.png)
+![Download CSV](images/download_csv.png)
 
-Run:
+Source page:
+```text
+https://www.swisstopo.admin.ch/de/hoehenmodell-swissalti3d
+```
+
+This project is built around the GUI. Use it to download SwissTopo XYZ or GeoTIFF tiles, convert them into STL tiles, and merge them into a single printable STL with optional base, border clipping, and lake lowering.
+
+Prefer GeoTIFF (COG) when available because it is much smaller than ASCII XYZ.
+
+Run the GUI:
 
 ```bash
 python gui.py
 ```
 
-The GUI now shows:
+---
 
-- A pipeline overview with detected inputs, tile STLs, and final STL status
-- A simplified conversion section with `Draft`, `Balanced`, `Fine`, and `Custom`
-- A simplified merge section focused on the final STL path and printable base
-- A `Run Full Pipeline` button that can download, convert, and merge in sequence
+## Setup so it just works (Windows only)
 
-## Recommended Workflow
+Follow these steps once on each Windows computer. After that, you can launch the GUI with a double-click or one command.
 
-### Option A: Start from a SwissTopo CSV
+**1) Install Python (once)**
+- Install **Python 3.10+** from python.org.
+- During install, check **"Add Python to PATH"**.
 
-1. Export the SwissTopo download CSV
-2. Open `gui.py`
-3. Select the CSV
-4. Set the model name
-5. Choose the final model size in mm
-6. Leave the detail preset on `Balanced` unless you need faster or finer output
-7. Leave `Add printable base` enabled for 3D printing
-8. Click `Run Full Pipeline`
+**2) Get the project**
+- Option A: Download the ZIP from GitHub and extract it.
+- Option B: Use Git to clone the repo.
 
-### Option B: Start from already-downloaded files
+**3) Install the required packages (once per machine)**
 
-Put your terrain files here:
-
-- `data/xyz/*.xyz`
-- `data/tif/*.tif`
-- `data/tif/*.tiff`
-
-Then open the GUI and run:
-
-1. `Create STL Tiles`
-2. `Build Final STL`
-
-## What The Presets Mean
-
-- `Draft`: faster conversion, lighter STL files
-- `Balanced`: default choice for most prints
-- `Fine`: keeps more terrain detail, slower and larger output
-- `Custom`: unlocks manual step size, alternate scaling modes, tolerance, and worker count
-
-## Advanced Features
-
-Open the advanced panels only if you need them.
-
-Available advanced conversion controls:
-
-- Manual `--step`
-- Fixed tile size scaling
-- Scale ratio input like `1:100`
-- Grid tolerance for noisy XYZ data
-- Worker count
-
-Available advanced merge controls:
-
-- Weld tolerance
-- Merge-only Z scaling
-- Lake lowering
-- Base mode and base Z override
-- Border clipping using Swiss boundary shapefiles
-- Canton/bezirk filtering
-
-## SwissTopo CSV
-
-Typical flow for SwissTopo:
-
-1. Open the swissALTI3D page
-2. Select the tiles you want
-3. Export the CSV of download URLs
-4. Use that CSV in the GUI
-
-Reference:
-
-```text
-https://www.swisstopo.admin.ch/de/hoehenmodell-swissalti3d
+```bash
+py -3 -m pip install --upgrade pip
+py -3 -m pip install numpy
 ```
 
-## Folders
+Optional, only if needed:
+
+```bash
+py -3 -m pip install scipy
+py -3 -m pip install rasterio
+py -3 -m pip install shapely pyshp
+```
+
+- `scipy`: triangulation fallback for non-grid XYZ data
+- `rasterio`: GeoTIFF / COG input
+- `shapely` and `pyshp`: border clipping, region filtering, and lake lowering
+
+**Optional: use Conda instead of the system Python**
+
+```bash
+conda create -n swisstopo-stl python=3.11 -y
+conda activate swisstopo-stl
+python -m pip install --upgrade pip
+python -m pip install numpy
+```
+
+**4) Start the GUI**
+
+```bash
+py -3 gui.py
+```
+
+---
+
+## Current GUI Workflow
+
+The current GUI is organized around a simple default path:
+
+1. Select a SwissTopo CSV or use files already in `data/`
+2. Choose the final model size and a detail preset
+3. Click **Run Full Pipeline**
+
+The app also exposes step-by-step buttons if you want manual control:
+
+1. **Run Download**
+2. **Create STL Tiles**
+3. **Build Final STL**
+
+At the top of the window, the pipeline summary shows detected inputs, tile STL status, and the final STL path. The default workflow keeps advanced controls hidden until you enable them.
+
+### Detail presets
+
+- **Draft**: fastest conversion, lighter STL files
+- **Balanced**: default for most prints
+- **Fine**: more terrain detail, slower and larger output
+- **Custom**: unlocks manual conversion controls
+
+### Advanced panels
+
+When needed, enable:
+
+- **Show advanced conversion settings**
+- **Show advanced merge settings**
+
+This reveals controls such as manual step size, explicit scale source, grid tolerance, worker count, weld tolerance, merge-only Z scaling, border clipping, and lake lowering.
+
+---
+
+## Step 1: Download XYZ/TIF tiles
+
+This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `data/xyz`. It also supports GeoTIFF or COG URLs that download directly into `data/tif`.
+
+**How to use it**
+- Click **Browse** and select your CSV with download URLs.
+- Optionally click **Copy to data/** to keep a copy inside the project.
+- Click **Run Download**.
+- If existing terrain tiles are found, the GUI can prompt to clean them first.
+
+**CSV expectations**
+- One URL per line is enough.
+- If the file has multiple columns, only the first column is used.
+- Comment lines starting with `#` are ignored.
+- Supports ZIPs containing XYZ and direct GeoTIFF/COG URLs.
+
+**Typical SwissTopo sources**
+- swissALTI3D (DTM)
+- swissSURFACE3D Raster (DSM)
+
+---
+
+## Step 2: Convert XYZ/TIF to STL tiles
+
+This step converts every `.xyz` file in `data/xyz` and every `.tif/.tiff` file in `data/tif` into one STL tile per file in `output/tiles`.
+
+### Default conversion flow
+
+In the current GUI, the normal path is:
+
+- Choose a final model size in millimeters
+- Pick a preset such as **Balanced**
+- Let the app derive the conversion settings automatically
+
+### Advanced conversion options
+
+When **Custom** mode or advanced conversion is enabled, you can control:
+
+- **Downsample step**: keep every Nth point in X and Y
+- **Tile size (mm for 1 km)**: fixed physical tile size workflow
+- **Scale ratio**: for example `1:100`
+- **Grid tolerance**: snap noisy XY coordinates to a grid
+- **Max parallel conversions**
+- **Z scale (tile conversion)**: vertical exaggeration during tile generation
+
+**Tip**
+- Delete old tile STLs before a fresh run so unrelated tiles do not get merged later.
+
+---
+
+## Step 3: Merge tiles into final STL
+
+This step merges all tiles in `output/tiles` into a single STL and can also prepare it for printing.
+
+### Main merge options
+
+- **Output STL path**: where the final STL is saved
+- **Add printable base**: creates a watertight solid with walls and a flat bottom
+- **Base thickness**: thickness below the terrain minimum
+- **Base Z (optional)**: explicit base elevation that overrides thickness
+
+### Advanced merge options
+
+- **Weld tolerance**: removes seams between neighboring tiles
+- **Merge Z scale**: applies Z scaling during merge only
+- **Border clipping**: clip the merged terrain to a Swiss border shapefile
+- **Detect touched** and region selection: limit clipping to intersecting canton or bezirk features
+- **Lake lowering (mm)**: lower merged lake surfaces by a chosen amount after scaling
+
+### Lake lowering
+
+The new lake option works during the final merge stage.
+
+- It is available as **Lake lowering (mm)** in the merge section
+- Set it to `0` to disable
+- The tool auto-detects the standing-water shapefile from `./geometry_data`
+- It lowers vertices that fall inside detected lake polygons in the merged model
+- This is useful when you want lakes to read more clearly in the printed terrain
+
+For the CLI, the same feature is exposed with:
+
+```bash
+python build_stl.py --merge-stl output/terrain.stl --lake-lower-mm 1.2
+```
+
+If lake lowering is enabled and no standing-water shapefile is found in `./geometry_data`, the merge will stop with an error so the result is not silently wrong.
+
+### Border clipping
+
+Border clipping is optional and uses Swiss boundary shapefiles from `./geometry_data`.
+
+- **Clip to Swiss border** trims triangles outside the chosen geometry
+- **Border shapefile** lets you choose the `.shp` file
+- **Border scale** supports `auto` and reuses stored tile scale information when available
+- **Keep canton/bezirk** can restrict the output to specific touched regions
+
+---
+
+## Files and Folders
 
 ```text
 project/
   gui.py
-  build_stl.py
   download_tiles.py
+  build_stl.py
+  defaults.py
   data/
     your_urls.csv
     xyz/
+      tile_001.xyz
+      tile_002.xyz
     tif/
+      tile_003.tif
   output/
     tiles/
+      tile_001.stl
+      tile_002.stl
+      tile_003.stl
     terrain.stl
   geometry_data/
+    swissboundaries.../
+      LANDESGRENZE.shp
+      KANTONSGRENZE.shp
+      BEZIRKSGRENZE.shp
+    swisstlm3d.../
+      TLM_GEWAESSER/
+        swissTLM3D_TLM_STEHENDES_GEWAESSER.shp
+  images/
+    selection.png
+    download_csv.png
 ```
 
-## Dependencies
+---
 
-Minimum:
+## CLI (optional)
 
-```bash
-pip install numpy
-```
-
-Optional:
-
-```bash
-pip install rasterio
-pip install scipy
-pip install shapely pyshp
-```
-
-Use these only if needed:
-
-- `rasterio` for GeoTIFF/COG input
-- `scipy` for triangulation fallback on non-grid XYZ data
-- `shapely` and `pyshp` for border clipping and lake lowering
-
-## CLI
-
-The CLI still works if you want direct control:
+Everything the GUI does is available from the command line if you want direct control:
 
 ```bash
 python download_tiles.py --csv path/to/urls.csv
 python build_stl.py --all --target-size-mm 150
-python build_stl.py --merge-stl output/terrain.stl --make-solid
+python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001 --make-solid
+python build_stl.py --merge-stl output/terrain.stl --lake-lower-mm 1.2
+python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp geometry_data/swissboundaries.../LANDESGRENZE.shp --border-scale auto
+python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp geometry_data/swissboundaries.../KANTONSGRENZE.shp --border-keep "Bern,Uri"
 ```
 
-## Notes
+---
 
-- `Balanced` plus a final model size is the intended default for most users
-- Keep advanced settings hidden unless you actually need them
-- Border clipping and lake lowering depend on the shapefiles in `geometry_data/`
+## Troubleshooting
+
+**Nothing downloads**
+- Check that your CSV has valid `http://` or `https://` URLs.
+
+**Grid not detected**
+- Increase **Grid tolerance** such as `0.001`.
+- Check for missing points in the XYZ grid.
+
+**STL too large**
+- Use a coarser preset such as **Draft**, or increase the manual downsample step.
+
+**Lake lowering does nothing**
+- Confirm the lake lowering value is greater than `0`.
+- Confirm the standing-water shapefile exists under `geometry_data`.
+- Confirm the lakes actually intersect the merged model bounds.
+
+---
+
+## License
+
+Free to use, modify, and adapt for terrain processing, GIS, CAD, or 3D printing workflows.
