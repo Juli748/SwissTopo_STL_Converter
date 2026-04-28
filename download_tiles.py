@@ -152,11 +152,11 @@ def main():
 
     repo_root = Path(__file__).resolve().parent
     data_dir = repo_root / "data"
-    data_dir.mkdir(parents=True, exist_ok=True)
     csv_files = _iter_csv_paths(repo_root, args.csv_path)
     if not csv_files:
         return 1
 
+    data_dir.mkdir(parents=True, exist_ok=True)
     extract_dir = data_dir / "_extract_temp"
     extract_dir.mkdir(parents=True, exist_ok=True)
     zips_temp_dir = data_dir / "_zips_temp"

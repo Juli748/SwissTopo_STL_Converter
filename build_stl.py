@@ -51,6 +51,115 @@ class Mesh:
     faces: np.ndarray     # (M, 3) int64 indices into vertices
 
 
+class CropOutsideInput(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class CropRect:
+    min_x: float
+    min_y: float
+    max_x: float
+    max_y: float
+
+
+def _parse_crop_rect(values: Optional[List[float]]) -> Optional[CropRect]:
+    if values is None:
+        return None
+    if len(values) != 4:
+        raise ValueError("--crop-rect requires exactly 4 values: WEST SOUTH EAST NORTH")
+
+    west, south, east, north = (float(v) for v in values)
+    if west >= east:
+        raise ValueError("--crop-rect WEST must be smaller than EAST")
+    if south >= north:
+        raise ValueError("--crop-rect SOUTH must be smaller than NORTH")
+    return CropRect(min_x=west, min_y=south, max_x=east, max_y=north)
+
+
+def _bounds_intersect_rect(
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+    crop_rect: Optional[CropRect],
+) -> bool:
+    if crop_rect is None:
+        return True
+    return not (
+        max_x < crop_rect.min_x or
+        min_x > crop_rect.max_x or
+        max_y < crop_rect.min_y or
+        min_y > crop_rect.max_y
+    )
+
+
+def _crop_points(points: np.ndarray, crop_rect: Optional[CropRect], *, label: str) -> np.ndarray:
+    if crop_rect is None:
+        return points
+
+    mask = (
+        (points[:, 0] >= crop_rect.min_x) &
+        (points[:, 0] <= crop_rect.max_x) &
+        (points[:, 1] >= crop_rect.min_y) &
+        (points[:, 1] <= crop_rect.max_y)
+    )
+    cropped = points[mask]
+    print(
+        f"[CROP] {label}: kept {cropped.shape[0]:,}/{points.shape[0]:,} points "
+        f"inside X {crop_rect.min_x:.3f}..{crop_rect.max_x:.3f}, "
+        f"Y {crop_rect.min_y:.3f}..{crop_rect.max_y:.3f}"
+    )
+    if cropped.size == 0:
+        raise CropOutsideInput(f"{label}: no points remain after --crop-rect")
+    return cropped
+
+
+def _crop_grid(
+    xs: np.ndarray,
+    ys: np.ndarray,
+    zs: np.ndarray,
+    crop_rect: Optional[CropRect],
+    *,
+    label: str,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    if crop_rect is None:
+        return xs, ys, zs
+
+    if xs.ndim == 1 and ys.ndim == 1:
+        x_mask = (xs >= crop_rect.min_x) & (xs <= crop_rect.max_x)
+        y_mask = (ys >= crop_rect.min_y) & (ys <= crop_rect.max_y)
+        if int(x_mask.sum()) < 2 or int(y_mask.sum()) < 2:
+            raise CropOutsideInput(f"{label}: crop rectangle leaves fewer than 2 raster samples in X or Y")
+        cropped_xs = xs[x_mask]
+        cropped_ys = ys[y_mask]
+        cropped_zs = zs[np.ix_(y_mask, x_mask)]
+        print(
+            f"[CROP] {label}: raster grid {len(xs):,}x{len(ys):,} -> "
+            f"{len(cropped_xs):,}x{len(cropped_ys):,}"
+        )
+        return cropped_xs, cropped_ys, cropped_zs
+
+    mask = (
+        (xs >= crop_rect.min_x) &
+        (xs <= crop_rect.max_x) &
+        (ys >= crop_rect.min_y) &
+        (ys <= crop_rect.max_y)
+    )
+    row_mask = np.any(mask, axis=1)
+    col_mask = np.any(mask, axis=0)
+    if int(row_mask.sum()) < 2 or int(col_mask.sum()) < 2:
+        raise CropOutsideInput(f"{label}: crop rectangle leaves fewer than 2 raster samples in X or Y")
+    cropped_xs = xs[np.ix_(row_mask, col_mask)]
+    cropped_ys = ys[np.ix_(row_mask, col_mask)]
+    cropped_zs = zs[np.ix_(row_mask, col_mask)]
+    print(
+        f"[CROP] {label}: raster grid {zs.shape[1]:,}x{zs.shape[0]:,} -> "
+        f"{cropped_zs.shape[1]:,}x{cropped_zs.shape[0]:,}"
+    )
+    return cropped_xs, cropped_ys, cropped_zs
+
+
 # ----------------------------
 # XYZ -> mesh
 # ----------------------------
@@ -178,6 +287,7 @@ def _scan_xyz_bounds_and_resolution(
     xyz_files: List[Path],
     *,
     round_decimals: int = 6,
+    crop_rect: Optional[CropRect] = None,
 ) -> Tuple[float, float, float, float, float]:
     min_x = float("inf")
     max_x = float("-inf")
@@ -210,13 +320,16 @@ def _scan_xyz_bounds_and_resolution(
                         continue
                     raise ValueError(f"{path}:{line_no}: could not parse floats: {s}")
 
-                min_x = min(min_x, x)
-                max_x = max(max_x, x)
-                min_y = min(min_y, y)
-                max_y = max(max_y, y)
-
-                xs.add(round(x, round_decimals))
-                ys.add(round(y, round_decimals))
+                if crop_rect is None or (
+                    crop_rect.min_x <= x <= crop_rect.max_x and
+                    crop_rect.min_y <= y <= crop_rect.max_y
+                ):
+                    min_x = min(min_x, x)
+                    max_x = max(max_x, x)
+                    min_y = min(min_y, y)
+                    max_y = max(max_y, y)
+                    xs.add(round(x, round_decimals))
+                    ys.add(round(y, round_decimals))
 
         dx = _min_spacing(list(xs))
         dy = _min_spacing(list(ys))
@@ -235,7 +348,11 @@ def _scan_xyz_bounds_and_resolution(
     return min_x, max_x, min_y, max_y, min_spacing
 
 
-def _scan_tif_bounds_and_resolution(tif_files: List[Path]) -> Tuple[float, float, float, float, float]:
+def _scan_tif_bounds_and_resolution(
+    tif_files: List[Path],
+    *,
+    crop_rect: Optional[CropRect] = None,
+) -> Tuple[float, float, float, float, float]:
     try:
         import rasterio
     except Exception as e:
@@ -253,10 +370,17 @@ def _scan_tif_bounds_and_resolution(tif_files: List[Path]) -> Tuple[float, float
         print(f"[AUTO] Scanning GeoTIFF: {path}")
         with rasterio.open(path) as dataset:
             bounds = dataset.bounds
-            min_x = min(min_x, bounds.left)
-            max_x = max(max_x, bounds.right)
-            min_y = min(min_y, bounds.bottom)
-            max_y = max(max_y, bounds.top)
+            if not _bounds_intersect_rect(bounds.left, bounds.bottom, bounds.right, bounds.top, crop_rect):
+                print("[AUTO]  Outside crop rectangle")
+                continue
+            file_min_x = max(float(bounds.left), crop_rect.min_x) if crop_rect is not None else float(bounds.left)
+            file_max_x = min(float(bounds.right), crop_rect.max_x) if crop_rect is not None else float(bounds.right)
+            file_min_y = max(float(bounds.bottom), crop_rect.min_y) if crop_rect is not None else float(bounds.bottom)
+            file_max_y = min(float(bounds.top), crop_rect.max_y) if crop_rect is not None else float(bounds.top)
+            min_x = min(min_x, file_min_x)
+            max_x = max(max_x, file_max_x)
+            min_y = min(min_y, file_min_y)
+            max_y = max(max_y, file_max_y)
             res_x, res_y = dataset.res
             spacing = min(abs(float(res_x)), abs(float(res_y)))
             if spacing > 0:
@@ -273,6 +397,8 @@ def _scan_tif_bounds_and_resolution(tif_files: List[Path]) -> Tuple[float, float
 
 def scan_input_bounds_and_resolution(
     input_files: List[Path],
+    *,
+    crop_rect: Optional[CropRect] = None,
 ) -> Tuple[float, float, float, float, float]:
     xyz_files = [p for p in input_files if p.suffix.lower() == ".xyz"]
     tif_files = [p for p in input_files if p.suffix.lower() in {".tif", ".tiff"}]
@@ -284,7 +410,7 @@ def scan_input_bounds_and_resolution(
     min_spacing = float("inf")
 
     if xyz_files:
-        x0, x1, y0, y1, spacing = _scan_xyz_bounds_and_resolution(xyz_files)
+        x0, x1, y0, y1, spacing = _scan_xyz_bounds_and_resolution(xyz_files, crop_rect=crop_rect)
         min_x = min(min_x, x0)
         max_x = max(max_x, x1)
         min_y = min(min_y, y0)
@@ -292,7 +418,7 @@ def scan_input_bounds_and_resolution(
         min_spacing = min(min_spacing, spacing)
 
     if tif_files:
-        x0, x1, y0, y1, spacing = _scan_tif_bounds_and_resolution(tif_files)
+        x0, x1, y0, y1, spacing = _scan_tif_bounds_and_resolution(tif_files, crop_rect=crop_rect)
         min_x = min(min_x, x0)
         max_x = max(max_x, x1)
         min_y = min(min_y, y0)
@@ -362,8 +488,12 @@ def _auto_scale_and_step(
     target_size_mm: float,
     target_resolution_mm: float,
     edge_mode: str,
+    crop_rect: Optional[CropRect] = None,
 ) -> Tuple[float, int]:
-    min_x, max_x, min_y, max_y, min_spacing = scan_input_bounds_and_resolution(input_files)
+    min_x, max_x, min_y, max_y, min_spacing = scan_input_bounds_and_resolution(
+        input_files,
+        crop_rect=crop_rect,
+    )
     span_x = max_x - min_x
     span_y = max_y - min_y
     min_edge = min(span_x, span_y)
@@ -402,8 +532,9 @@ def _auto_step_from_scale(
     *,
     scale: float,
     target_resolution_mm: float,
+    crop_rect: Optional[CropRect] = None,
 ) -> int:
-    _, _, _, _, min_spacing = scan_input_bounds_and_resolution(input_files)
+    _, _, _, _, min_spacing = scan_input_bounds_and_resolution(input_files, crop_rect=crop_rect)
     spacing_mm = min_spacing * float(scale)
     if spacing_mm <= 0:
         raise ValueError("Computed spacing is not positive; check input resolution/scale.")
@@ -901,6 +1032,7 @@ def convert_one(
     base_z_value: Optional[float],
     base_mode: str,
     assume_grid: bool,
+    crop_rect: Optional[CropRect],
 ) -> None:
     print("\n" + "=" * 80)
     print(f"Converting: {xyz_path.name} -> {stl_path.name}")
@@ -908,6 +1040,7 @@ def convert_one(
 
     if xyz_path.suffix.lower() in {".tif", ".tiff"}:
         xs, ys, zs = load_geotiff_grid(xyz_path)
+        xs, ys, zs = _crop_grid(xs, ys, zs, crop_rect, label=xyz_path.name)
         if scale != 1.0:
             print(f"[1/4] Applying scale: {scale}")
             xs = xs * float(scale)
@@ -920,6 +1053,7 @@ def convert_one(
         mesh = mesh_from_grid(xs, ys, zs, step=int(step))
     else:
         pts = load_xyz(xyz_path)
+        pts = _crop_points(pts, crop_rect, label=xyz_path.name)
         if scale != 1.0:
             print(f"[1/4] Applying scale: {scale}")
             pts = pts.copy()
@@ -951,7 +1085,7 @@ def convert_one(
 
 
 def _convert_worker(
-    payload: Tuple[Path, Path, str, float, float, float, int, float, Optional[float], str, bool]
+    payload: Tuple[Path, Path, str, float, float, float, int, float, Optional[float], str, bool, Optional[CropRect]]
 ) -> str:
     (
         xyz_path,
@@ -965,22 +1099,27 @@ def _convert_worker(
         base_z_value,
         base_mode,
         assume_grid,
+        crop_rect,
     ) = payload
-    convert_one(
-        xyz_path,
-        stl_path,
-        name=per_file_name,
-        tol=float(tol),
-        z_scale=float(z_scale),
-        scale=float(scale),
-        step=int(step),
-        binary=True,
-        make_solid_flag=False,
-        base_thickness_value=float(base_thickness_value),
-        base_z_value=base_z_value,
-        base_mode=str(base_mode),
-        assume_grid=bool(assume_grid),
-    )
+    try:
+        convert_one(
+            xyz_path,
+            stl_path,
+            name=per_file_name,
+            tol=float(tol),
+            z_scale=float(z_scale),
+            scale=float(scale),
+            step=int(step),
+            binary=True,
+            make_solid_flag=False,
+            base_thickness_value=float(base_thickness_value),
+            base_z_value=base_z_value,
+            base_mode=str(base_mode),
+            assume_grid=bool(assume_grid),
+            crop_rect=crop_rect,
+        )
+    except CropOutsideInput as exc:
+        print(f"[SKIP] {exc}")
     return xyz_path.name
 
 
@@ -2030,6 +2169,16 @@ def main() -> None:
         help="Target XY point spacing in the final STL (mm) when using --target-size-mm (default: 0.3).",
     )
     ap.add_argument(
+        "--crop-rect",
+        type=float,
+        nargs=4,
+        metavar=("WEST", "SOUTH", "EAST", "NORTH"),
+        default=None,
+        help="Crop conversion to this source-coordinate rectangle before scaling/triangulation. "
+             "Use the SwissTopo order WEST SOUTH EAST NORTH, "
+             "e.g. --crop-rect 2600000 1200000 2600500 1200400.",
+    )
+    ap.add_argument(
         "--make-solid",
         action="store_true",
         help="Make the terrain printable by adding a flat bottom and side walls (watertight solid). "
@@ -2100,6 +2249,14 @@ def main() -> None:
     if float(args.lake_lower_mm) > 0.0 and args.merge_stl is None:
         ap.error("--lake-lower-mm can only be used with --merge-stl.")
 
+    try:
+        crop_rect = _parse_crop_rect(args.crop_rect)
+    except ValueError as exc:
+        ap.error(str(exc))
+
+    if crop_rect is not None and args.merge_stl is not None:
+        ap.error("--crop-rect can only be used with --all conversion.")
+
     if args.merge_stl is not None:
         border_geom = None
         lake_shp = None
@@ -2163,6 +2320,12 @@ def main() -> None:
             f"Found {len(input_files)} input file(s) "
             f"({xyz_count} XYZ, {tif_count} TIF) under ./data/xyz, ./data/tif, or ./data"
         )
+        if crop_rect is not None:
+            print(
+                f"[CROP] Source coordinate rectangle: "
+                f"X {crop_rect.min_x:.3f}..{crop_rect.max_x:.3f}, "
+                f"Y {crop_rect.min_y:.3f}..{crop_rect.max_y:.3f}"
+            )
 
         target_size_mm = args.target_size_mm
         tile_size_mm = args.tile_size_mm
@@ -2183,6 +2346,7 @@ def main() -> None:
                 target_size_mm=float(target_size_mm),
                 target_resolution_mm=float(args.target_resolution_mm),
                 edge_mode=target_edge,
+                crop_rect=crop_rect,
             )
         elif tile_size_mm is not None:
             auto_scale = float(tile_size_mm) / float(input_tile_edge_units)
@@ -2194,6 +2358,7 @@ def main() -> None:
                 input_files,
                 scale=float(auto_scale),
                 target_resolution_mm=float(args.target_resolution_mm),
+                crop_rect=crop_rect,
             )
         elif scale_ratio is not None:
             ratio = _parse_scale_ratio(str(scale_ratio))
@@ -2206,6 +2371,7 @@ def main() -> None:
                 input_files,
                 scale=float(auto_scale),
                 target_resolution_mm=float(args.target_resolution_mm),
+                crop_rect=crop_rect,
             )
 
         output_tiles_dir = Path("./output/tiles")
@@ -2226,6 +2392,16 @@ def main() -> None:
                     {
                         "scale_xy": float(auto_scale),
                         "z_scale": float(args.z_scale),
+                        "crop_rect": (
+                            {
+                                "min_x": crop_rect.min_x,
+                                "min_y": crop_rect.min_y,
+                                "max_x": crop_rect.max_x,
+                                "max_y": crop_rect.max_y,
+                            }
+                            if crop_rect is not None
+                            else None
+                        ),
                     },
                     indent=2,
                 ),
@@ -2234,7 +2410,7 @@ def main() -> None:
         except OSError:
             print(f"[WARN] Failed to write {scale_info_path}")
 
-        tasks: List[Tuple[Path, Path, str, float, float, float, int, float, Optional[float], str, bool]] = []
+        tasks: List[Tuple[Path, Path, str, float, float, float, int, float, Optional[float], str, bool, Optional[CropRect]]] = []
         model_name = args.model_name.strip()
         for input_path in input_files:
             if model_name:
@@ -2256,6 +2432,7 @@ def main() -> None:
                     args.base_z,
                     str(args.base_mode),
                     True,
+                    crop_rect,
                 )
             )
 
