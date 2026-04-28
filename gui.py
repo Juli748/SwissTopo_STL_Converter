@@ -370,6 +370,7 @@ class App(tk.Tk):
         self.scale_mode_var = tk.StringVar(value=DEFAULTS["scale_mode"])
         self.target_size_var = tk.StringVar(value=DEFAULTS["target_size_mm"])
         self.target_res_var = tk.StringVar(value=DEFAULTS["target_resolution_mm"])
+        self.use_input_resolution_var = tk.BooleanVar(value=DEFAULTS["use_input_resolution"])
         self.target_edge_var = tk.StringVar(value=DEFAULTS["target_edge"])
         self.tile_size_var = tk.StringVar(value=DEFAULTS["tile_size_mm"])
         self.scale_ratio_var = tk.StringVar(value=DEFAULTS["scale_ratio"])
@@ -444,6 +445,14 @@ class App(tk.Tk):
         self.z_scale_label.grid(row=1, column=2, sticky=tk.W, padx=(12, 0), pady=4)
         z_scale_entry = ttk.Entry(detail_frame, textvariable=self.z_scale_var, width=10)
         z_scale_entry.grid(row=1, column=3, sticky=tk.W, padx=(8, 0))
+
+        self.use_input_resolution_check = ttk.Checkbutton(
+            detail_frame,
+            text="Use full input resolution",
+            variable=self.use_input_resolution_var,
+            command=self._on_custom_conversion_setting_change,
+        )
+        self.use_input_resolution_check.grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(4, 0))
 
         crop_frame = ttk.LabelFrame(basic, text="Optional Crop Area")
         crop_frame.grid(row=1, column=0, columnspan=2, sticky=tk.EW, pady=(0, 4))
@@ -597,6 +606,10 @@ class App(tk.Tk):
             Tooltip(
                 self.target_res_entry,
                 "Smaller spacing keeps more points and increases STL size. Ignored when using a manual step.",
+            ),
+            Tooltip(
+                self.use_input_resolution_check,
+                "Keep every source terrain sample. This can create very large STL files.",
             ),
             Tooltip(
                 z_scale_entry,
@@ -1342,6 +1355,8 @@ class App(tk.Tk):
         if preset == "fine":
             return "Higher detail, 0.2 mm point spacing."
         if preset == "custom":
+            if getattr(self, "use_input_resolution_var", None) is not None and self.use_input_resolution_var.get():
+                return "Custom: full input resolution."
             spacing = self.target_res_var.get().strip() or "custom"
             return f"Custom point spacing: {spacing} mm."
         return "Balanced detail, 0.3 mm point spacing."
@@ -1364,14 +1379,17 @@ class App(tk.Tk):
         if preset == "draft":
             self.mode_var.set("auto")
             self.scale_mode_var.set("target_size")
+            self.use_input_resolution_var.set(False)
             self.target_res_var.set("0.8")
         elif preset == "fine":
             self.mode_var.set("auto")
             self.scale_mode_var.set("target_size")
+            self.use_input_resolution_var.set(False)
             self.target_res_var.set("0.2")
         elif preset == "balanced":
             self.mode_var.set("auto")
             self.scale_mode_var.set("target_size")
+            self.use_input_resolution_var.set(False)
             self.target_res_var.set("0.3")
 
     def _on_detail_preset_change(self) -> None:
@@ -1517,9 +1535,12 @@ class App(tk.Tk):
                 scale_ratio = self.scale_ratio_var.get().strip()
                 if scale_ratio:
                     args += ["--scale-ratio", scale_ratio]
-            target_res = self.target_res_var.get().strip()
-            if target_res:
-                args += ["--target-resolution-mm", target_res]
+            if self.use_input_resolution_var.get():
+                args.append("--input-resolution")
+            else:
+                target_res = self.target_res_var.get().strip()
+                if target_res:
+                    args += ["--target-resolution-mm", target_res]
         else:
             step = self.step_var.get().strip()
             if step:
@@ -1788,11 +1809,13 @@ class App(tk.Tk):
         enable_tile = scale_mode == "tile_size"
         enable_ratio = scale_mode == "scale_ratio"
         enable_step = not auto_mode
-        enable_res = auto_mode
+        use_input_resolution = self.use_input_resolution_var.get()
+        enable_res = auto_mode and not use_input_resolution
         enable_crop = self.crop_enabled_var.get()
 
         self.target_size_entry.configure(state="normal" if enable_target else "disabled")
         self.target_res_entry.configure(state="normal" if enable_res else "disabled")
+        self.use_input_resolution_check.configure(state="normal" if auto_mode else "disabled")
         self.target_edge_combo.configure(state="readonly" if enable_target else "disabled")
         self.step_entry.configure(state="normal" if enable_step else "disabled")
         self.tile_size_entry.configure(state="normal" if enable_tile else "disabled")

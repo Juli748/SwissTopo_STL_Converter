@@ -92,6 +92,7 @@ The default workflow keeps advanced controls hidden until you enable them.
 - **Balanced**: default for most prints
 - **Fine**: more terrain detail, slower and larger output
 - **Custom**: used when you type your own point spacing
+- **Use full input resolution**: keeps every source sample; this can create very large STL files
 
 ### Advanced panels
 
@@ -145,6 +146,7 @@ When **Show advanced overrides** is enabled, you can control:
 - **Downsample step**: keep every Nth point in X and Y
 - **Tile size (mm for 1 km)**: fixed physical tile size workflow
 - **Scale ratio**: for example `1:100`
+- **Use full input resolution**: equivalent to downsample step `1`
 - **Grid tolerance**: snap noisy XY coordinates to a grid
 - **Max parallel conversions**
 - **Z scale (tile conversion)**: vertical exaggeration during tile generation
@@ -246,6 +248,7 @@ Everything the GUI does is available from the command line if you want direct co
 ```bash
 python download_tiles.py --csv path/to/urls.csv
 python build_stl.py --all --target-size-mm 150
+python build_stl.py --all --target-size-mm 150 --input-resolution
 python build_stl.py --all --target-size-mm 150 --crop-rect 2600000 1200000 2600500 1200400
 python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001 --make-solid
 python build_stl.py --merge-stl output/terrain.stl --lake-lower-mm 1.2

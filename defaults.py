@@ -12,6 +12,7 @@ DEFAULTS = {
     "scale_mode": "target_size",
     "target_size_mm": "100",
     "target_resolution_mm": "0.3",
+    "use_input_resolution": False,
     "target_edge": "longest",
     "tile_size_mm": "",
     "scale_ratio": "",

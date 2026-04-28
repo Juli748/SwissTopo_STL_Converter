@@ -2169,6 +2169,12 @@ def main() -> None:
         help="Target XY point spacing in the final STL (mm) when using --target-size-mm (default: 0.3).",
     )
     ap.add_argument(
+        "--input-resolution",
+        action="store_true",
+        help="Keep every source grid sample in the STL (equivalent to step=1 after crop/scale). "
+             "This can create very large STL files.",
+    )
+    ap.add_argument(
         "--crop-rect",
         type=float,
         nargs=4,
@@ -2239,6 +2245,8 @@ def main() -> None:
         ap.error("--tile-size-mm can only be used with --all.")
     if args.scale_ratio is not None and not args.all:
         ap.error("--scale-ratio can only be used with --all.")
+    if args.input_resolution and not args.all:
+        ap.error("--input-resolution can only be used with --all.")
 
     scale_mode_count = sum(
         1 for v in (args.target_size_mm, args.tile_size_mm, args.scale_ratio) if v is not None
@@ -2373,6 +2381,10 @@ def main() -> None:
                 target_resolution_mm=float(args.target_resolution_mm),
                 crop_rect=crop_rect,
             )
+
+        if bool(args.input_resolution):
+            auto_step = 1
+            print("[DETAIL] Using full input resolution: step=1 (no downsampling).")
 
         output_tiles_dir = Path("./output/tiles")
         if args.clean_tiles and output_tiles_dir.exists():
