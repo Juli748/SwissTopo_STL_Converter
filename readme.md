@@ -28,50 +28,67 @@ python gui.py
 
 ---
 
-## Setup so it just works (Windows only)
+## Setup so it just works
 
-Follow these steps once on each Windows computer. After that, you can launch the GUI with a double-click or one command.
+The recommended setup is to use the included Conda environment file:
 
-**1) Install Python (once)**
-- Install **Python 3.10+** from python.org.
-- During install, check **"Add Python to PATH"**.
+```text
+environment.yml
+```
+
+This file records the Python version and the packages needed by the project, including the geospatial libraries used for GeoTIFF input, border clipping, lake lowering, and geometry handling.
+
+The file is intentionally longer than a normal hand-written requirements list. It was exported from the working `swisstopo-stl` Conda environment, so it includes both the packages used directly by the code and the lower-level native libraries they need, such as GDAL, PROJ, TIFF/PNG/JPEG support, SQLite, OpenSSL, MKL, and Windows runtime packages. This makes the environment more reproducible.
+
+Follow these steps once on each computer. After that, you can launch the GUI with one command.
+
+**1) Install Conda**
+- Install Miniconda or Anaconda.
+- On Windows, use the **Anaconda Prompt** or a terminal where `conda` is available.
 
 **2) Get the project**
 - Option A: Download the ZIP from GitHub and extract it.
 - Option B: Use Git to clone the repo.
 
-**3) Install the required packages (once per machine)**
+**3) Create the project environment**
+
+From the project folder, run:
+
+```bash
+conda env create -f environment.yml
+```
+
+This creates an environment named:
+
+```text
+swisstopo-stl
+```
+
+If the environment already exists and you want to update it after `environment.yml` changes, run:
+
+```bash
+conda env update -n swisstopo-stl -f environment.yml --prune
+```
+
+**4) Activate the environment**
+
+```bash
+conda activate swisstopo-stl
+```
+
+**5) Start the GUI**
+
+```bash
+python gui.py
+```
+
+### Optional: minimal pip setup
+
+If you do not want to use Conda, you can try a smaller manual Python setup. This is less reproducible, especially for `rasterio`, `fiona`, and GDAL on Windows.
 
 ```bash
 py -3 -m pip install --upgrade pip
-py -3 -m pip install numpy
-```
-
-Optional, only if needed:
-
-```bash
-py -3 -m pip install scipy
-py -3 -m pip install rasterio
-py -3 -m pip install shapely pyshp
-```
-
-- `scipy`: triangulation fallback for non-grid XYZ data
-- `rasterio`: GeoTIFF / COG input
-- `shapely` and `pyshp`: border clipping, region filtering, and lake lowering
-
-**Optional: use Conda instead of the system Python**
-
-```bash
-conda create -n swisstopo-stl python=3.11 -y
-conda activate swisstopo-stl
-python -m pip install --upgrade pip
-python -m pip install numpy
-```
-
-**4) Start the GUI**
-
-```bash
-py -3 gui.py
+py -3 -m pip install numpy scipy rasterio fiona shapely pyshp
 ```
 
 ---
