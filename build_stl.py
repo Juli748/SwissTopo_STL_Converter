@@ -22,7 +22,7 @@ Global solid (important for printing):
     1) load ALL STL tiles into memory
     2) weld shared vertices (tile seams) using --weld-tol
     3) solidify ONCE globally (one bottom, one outer wall)
-  This avoids internal “steps” between tiles.
+  This avoids internal "steps" between tiles.
 """
 
 
@@ -34,6 +34,8 @@ import math
 import shutil
 import struct
 import sys
+import unicodedata
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -1160,6 +1162,22 @@ def _list_stl_files() -> List[Path]:
     return stl_files
 
 
+def _clear_tiles_dir() -> None:
+    tiles_dir = Path("./output/tiles")
+    if not tiles_dir.exists():
+        return
+    tiles_root = tiles_dir.resolve()
+    for path in tiles_dir.iterdir():
+        resolved = path.resolve()
+        if not str(resolved).lower().startswith(str(tiles_root).lower()):
+            raise RuntimeError(f"Refusing to delete outside tiles directory: {resolved}")
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
+    print(f"[CLEAN] Removed intermediate tile files from {tiles_dir}")
+
+
 # ----------------------------
 # STL merge modes
 # ----------------------------
@@ -1364,7 +1382,16 @@ def _is_border_shapefile(path: Path) -> bool:
 
 def _is_lake_shapefile(path: Path) -> bool:
     name = path.name.upper()
-    return "GEWAESSER" in name and "STEHENDES" in name
+    return "LAKE_POLYGONS" in name or ("GEWAESSER" in name and "STEHENDES" in name)
+
+
+def _is_river_shapefile(path: Path) -> bool:
+    return "FLIESSGEWAESSER" in path.name.upper()
+
+
+def _is_bridge_candidate_shapefile(path: Path) -> bool:
+    name = path.name.upper()
+    return any(token in name for token in ("BRIDGE_PROTECTION", "BRUECKEN", "BRUCKEN", "STRASSE", "EISENBAHN"))
 
 
 def _default_border_shp() -> Optional[Path]:
@@ -1385,7 +1412,30 @@ def _default_lake_shp() -> Optional[Path]:
             shp_files.extend(p for p in root.rglob("*.shp") if p.is_file() and _is_lake_shapefile(p))
     if not shp_files:
         return None
+    preferred = [p for p in shp_files if "LAKE_POLYGONS" in p.name.upper()]
+    return sorted(preferred or shp_files)[0]
+
+
+def _default_river_shp() -> Optional[Path]:
+    shp_files: List[Path] = []
+    for root in _geometry_search_roots():
+        if root.exists():
+            shp_files.extend(p for p in root.rglob("*.shp") if p.is_file() and _is_river_shapefile(p))
+    if not shp_files:
+        return None
     return sorted(shp_files)[0]
+
+
+def _default_bridge_shps() -> List[Path]:
+    shp_files: List[Path] = []
+    for root in _geometry_search_roots():
+        if root.exists():
+            shp_files.extend(p for p in root.rglob("*.shp") if p.is_file() and _is_bridge_candidate_shapefile(p))
+    preferred = [
+        p for p in shp_files
+        if any(token in p.name.upper() for token in ("BRIDGE_PROTECTION", "BRUECKEN", "BRUCKEN"))
+    ]
+    return sorted(preferred or shp_files)
 
 
 def _parse_border_scale(raw: str, tiles_dir: Path) -> float:
@@ -1408,6 +1458,50 @@ def _parse_border_keep_list(raw: str) -> List[str]:
         return []
     items = [part.strip() for part in raw.split(",")]
     return [item for item in items if item]
+
+
+def _parse_water_features(raw: str) -> Tuple[bool, bool]:
+    value = raw.strip().lower()
+    if value in {"", "all", "both", "lakes,rivers", "rivers,lakes"}:
+        return (True, True)
+    if value in {"none", "off"}:
+        return (False, False)
+
+    tokens = {part.strip().lower() for part in value.split(",") if part.strip()}
+    aliases = {
+        "lake": "lakes",
+        "lakes": "lakes",
+        "standing": "lakes",
+        "standing-water": "lakes",
+        "standing_water": "lakes",
+        "river": "rivers",
+        "rivers": "rivers",
+        "flowing": "rivers",
+        "flowing-water": "rivers",
+        "flowing_water": "rivers",
+    }
+    normalized = set()
+    invalid = []
+    for token in tokens:
+        mapped = aliases.get(token)
+        if mapped is None:
+            invalid.append(token)
+        else:
+            normalized.add(mapped)
+    if invalid:
+        raise ValueError(f"Unknown water feature value(s): {', '.join(sorted(invalid))}")
+    return ("lakes" in normalized, "rivers" in normalized)
+
+
+def _parse_water_feature_ids(raw: str) -> Optional[set[str]]:
+    value = raw.strip()
+    if not value or value.lower() in {"all", "*"}:
+        return None
+    ids = {part.strip().lower() for part in value.split(",") if part.strip()}
+    invalid = [item for item in ids if ":" not in item]
+    if invalid:
+        raise ValueError(f"Water feature IDs must look like lake:0 or river:3. Invalid: {', '.join(sorted(invalid))}")
+    return ids
 
 
 def _guess_border_label_field(field_defs, *, border_hint: str = "") -> Optional[str]:
@@ -1537,6 +1631,13 @@ def _scale_border_geometry(geom, scale: float):
     return shapely_scale(geom, xfact=scale, yfact=scale, origin=(0.0, 0.0))
 
 
+def _normalize_token(value: object) -> str:
+    text = "" if value is None else str(value)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return text.strip().lower()
+
+
 def _bounds_intersect(
     a_min_x: float,
     a_min_y: float,
@@ -1597,13 +1698,76 @@ def _lake_shape_parts(shape_obj) -> Tuple[List[object], List[object]]:
     return ([], lines)
 
 
-def _load_lake_geometries_for_bounds(
+def _water_record_name(field_names: List[str], record: object) -> str:
+    record_dict = dict(zip(field_names, record))
+    for field in ("NAME", "GEW_NAME"):
+        value = record_dict.get(field)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _water_record_fallback_label(field_names: List[str], record: object, prefix: str) -> str:
+    record_dict = dict(zip(field_names, record))
+    for field in ("GEWISS_NR", "GEW_LAUF_U", "GEW_NAME_U", "UUID", "OBJEKTART"):
+        value = record_dict.get(field)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return f"Unnamed {prefix} {text}"
+    return f"Unnamed {prefix}"
+
+
+def _best_water_name(names: List[str], prefix: str) -> str:
+    named = [name for name in names if name and not name.lower().startswith(f"unnamed {prefix}")]
+    if named:
+        return Counter(named).most_common(1)[0][0]
+    unnamed = [name for name in names if name]
+    if unnamed:
+        return Counter(unnamed).most_common(1)[0][0]
+    return f"Unnamed {prefix}"
+
+
+def _water_label_fields(reader) -> List[str]:
+    wanted = {"GROUP_KEY", "NAME", "GEW_NAME", "GEW_NAME_U", "GEW_LAUF_U", "GEWISS_NR", "OBJEKTART", "UUID"}
+    return [field[0] for field in reader.fields if field[0] != "DeletionFlag" and field[0] in wanted]
+
+
+def _water_group_key(field_names: List[str], record: object) -> str:
+    record_dict = dict(zip(field_names, record))
+    for field in ("GROUP_KEY", "GEWISS_NR", "GEW_LAUF_U", "GEW_NAME_U", "NAME", "UUID"):
+        value = record_dict.get(field)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return f"{field}:{text}"
+    return ""
+
+
+def _name_for_polygonized_lake(geom, line_features: List[Tuple[object, str]]) -> str:
+    names = []
+    boundary = geom.boundary.buffer(0.001)
+    for line, name in line_features:
+        if name and line.intersects(boundary):
+            names.append(name)
+    if not names:
+        names = [name for _line, name in line_features if name]
+    return _best_water_name(names, "lake")
+
+
+def _load_lake_features_for_bounds(
     shp_path: Path,
     *,
     min_x: float,
     min_y: float,
     max_x: float,
     max_y: float,
+    keep_ids: Optional[set[str]] = None,
 ):
     try:
         import shapefile  # pyshp
@@ -1616,10 +1780,12 @@ def _load_lake_geometries_for_bounds(
     if not shp_path.exists():
         raise FileNotFoundError(f"Lake shapefile not found: {shp_path}")
 
-    reader = shapefile.Reader(str(shp_path))
-    geoms = []
-    lines = []
-    for shape_record in reader.iterShapeRecords():
+    reader = shapefile.Reader(str(shp_path), encoding="latin1", encodingErrors="replace")
+    field_names = _water_label_fields(reader)
+    features = []
+    polygon_groups: Dict[str, Dict[str, object]] = {}
+    touched_keys = set()
+    for shape_record in reader.iterShapeRecords(fields=field_names, bbox=(min_x, min_y, max_x, max_y)):
         shape_bbox = getattr(shape_record.shape, "bbox", None)
         if shape_bbox and len(shape_bbox) >= 4:
             if not _bounds_intersect(
@@ -1633,8 +1799,15 @@ def _load_lake_geometries_for_bounds(
                 max_y,
             ):
                 continue
+        name = _water_record_name(field_names, shape_record.record) or _water_record_fallback_label(
+            field_names,
+            shape_record.record,
+            "lake",
+        )
+        group_key = _water_group_key(field_names, shape_record.record) or f"name:{name}"
         shape_polys, shape_lines = _lake_shape_parts(shape_record.shape)
-        lines.extend(shape_lines)
+        if shape_lines and group_key:
+            touched_keys.add(group_key)
         for geom in shape_polys:
             geom_bounds = geom.bounds
             if not _bounds_intersect(
@@ -1648,9 +1821,29 @@ def _load_lake_geometries_for_bounds(
                 max_y,
             ):
                 continue
-            geoms.append(geom)
-    if geoms or not lines:
-        return geoms
+            if group_key not in polygon_groups:
+                polygon_groups[group_key] = {"geoms": [], "names": []}
+            polygon_groups[group_key]["geoms"].append(geom)  # type: ignore[union-attr]
+            polygon_groups[group_key]["names"].append(name)  # type: ignore[union-attr]
+    if polygon_groups:
+        try:
+            from shapely.ops import unary_union
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "Lake lowering requires 'shapely'. Install with: pip install shapely"
+            ) from exc
+        for data in polygon_groups.values():
+            geoms = data["geoms"]
+            names = [name for name in data["names"] if name]  # type: ignore[index]
+            geom = geoms[0] if len(geoms) == 1 else unary_union(geoms)  # type: ignore[index]
+            features.append((geom, _best_water_name(names, "lake")))
+        selected = []
+        for idx, feature in enumerate(features):
+            if keep_ids is None or f"lake:{idx}" in keep_ids:
+                selected.append(feature)
+        return selected
+    if not touched_keys:
+        return []
 
     try:
         from shapely.ops import polygonize, unary_union
@@ -1659,22 +1852,66 @@ def _load_lake_geometries_for_bounds(
             "Lake lowering requires 'shapely'. Install with: pip install shapely"
         ) from exc
 
-    merged_lines = unary_union(lines)
-    for geom in polygonize(merged_lines):
-        geom_bounds = geom.bounds
-        if not _bounds_intersect(
-            float(geom_bounds[0]),
-            float(geom_bounds[1]),
-            float(geom_bounds[2]),
-            float(geom_bounds[3]),
-            min_x,
-            min_y,
-            max_x,
-            max_y,
-        ):
+    def add_polygonized(line_features: List[Tuple[object, str]]) -> None:
+        nonlocal features
+        polygon_idx = 0
+        lines = [line for line, _name in line_features]
+        merged_lines = unary_union(lines)
+        for geom in polygonize(merged_lines):
+            geom_bounds = geom.bounds
+            if not _bounds_intersect(
+                float(geom_bounds[0]),
+                float(geom_bounds[1]),
+                float(geom_bounds[2]),
+                float(geom_bounds[3]),
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            ):
+                continue
+            if keep_ids is None or f"lake:{polygon_idx}" in keep_ids:
+                features.append((geom, _name_for_polygonized_lake(geom, line_features)))
+            polygon_idx += 1
+
+    full_lake_line_features = []
+    for shape_record in reader.iterShapeRecords(fields=field_names):
+        group_key = _water_group_key(field_names, shape_record.record)
+        if group_key not in touched_keys:
             continue
-        geoms.append(geom)
-    return geoms
+            name = _water_record_name(field_names, shape_record.record) or _water_record_fallback_label(
+                field_names,
+                shape_record.record,
+                "lake",
+            )
+        _shape_polys, shape_lines = _lake_shape_parts(shape_record.shape)
+        full_lake_line_features.extend((line, name) for line in shape_lines)
+
+    if full_lake_line_features:
+        add_polygonized(full_lake_line_features)
+    return features
+
+
+def _load_lake_geometries_for_bounds(
+    shp_path: Path,
+    *,
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+    keep_ids: Optional[set[str]] = None,
+):
+    return [
+        geom
+        for geom, _name in _load_lake_features_for_bounds(
+            shp_path,
+            min_x=min_x,
+            min_y=min_y,
+            max_x=max_x,
+            max_y=max_y,
+            keep_ids=keep_ids,
+        )
+    ]
 
 
 def _load_all_lake_geometries(shp_path: Path):
@@ -1692,8 +1929,8 @@ def _load_all_lake_geometries(shp_path: Path):
     reader = shapefile.Reader(str(shp_path))
     geoms = []
     lines = []
-    for shape_record in reader.iterShapeRecords():
-        shape_polys, shape_lines = _lake_shape_parts(shape_record.shape)
+    for shape_obj in reader.iterShapes():
+        shape_polys, shape_lines = _lake_shape_parts(shape_obj)
         geoms.extend(shape_polys)
         lines.extend(shape_lines)
     if geoms or not lines:
@@ -1709,6 +1946,378 @@ def _load_all_lake_geometries(shp_path: Path):
     merged_lines = unary_union(lines)
     geoms.extend(list(polygonize(merged_lines)))
     return geoms
+
+
+def _load_all_water_lines(shp_path: Path):
+    try:
+        import shapefile  # pyshp
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "River detection requires 'pyshp' and 'shapely'. "
+            "Install with: pip install pyshp shapely"
+        ) from exc
+
+    if not shp_path.exists():
+        raise FileNotFoundError(f"River shapefile not found: {shp_path}")
+
+    reader = shapefile.Reader(str(shp_path))
+    lines = []
+    for shape_obj in reader.iterShapes():
+        _shape_polys, shape_lines = _lake_shape_parts(shape_obj)
+        lines.extend(shape_lines)
+    return lines
+
+
+def _load_water_line_features_for_bounds(
+    shp_path: Path,
+    *,
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+    keep_ids: Optional[set[str]] = None,
+):
+    try:
+        import shapefile  # pyshp
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "River detection requires 'pyshp' and 'shapely'. "
+            "Install with: pip install pyshp shapely"
+        ) from exc
+
+    if not shp_path.exists():
+        raise FileNotFoundError(f"River shapefile not found: {shp_path}")
+
+    reader = shapefile.Reader(str(shp_path), encoding="latin1", encodingErrors="replace")
+    field_names = _water_label_fields(reader)
+    grouped: Dict[str, Dict[str, object]] = {}
+    for shape_record in reader.iterShapeRecords(fields=field_names, bbox=(min_x, min_y, max_x, max_y)):
+        shape_bbox = getattr(shape_record.shape, "bbox", None)
+        if shape_bbox and len(shape_bbox) >= 4:
+            if not _bounds_intersect(
+                float(shape_bbox[0]),
+                float(shape_bbox[1]),
+                float(shape_bbox[2]),
+                float(shape_bbox[3]),
+                min_x,
+                min_y,
+                max_x,
+                max_y,
+            ):
+                continue
+        group_key = _water_group_key(field_names, shape_record.record)
+        name = _water_record_name(field_names, shape_record.record) or _water_record_fallback_label(
+            field_names,
+            shape_record.record,
+            "river",
+        )
+        _shape_polys, shape_lines = _lake_shape_parts(shape_record.shape)
+        if not shape_lines:
+            continue
+        if not group_key:
+            group_key = f"record:{len(grouped)}"
+        if group_key not in grouped:
+            grouped[group_key] = {"lines": [], "names": []}
+        grouped[group_key]["lines"].extend(shape_lines)  # type: ignore[union-attr]
+        grouped[group_key]["names"].append(name)  # type: ignore[union-attr]
+    features = []
+    for group_idx, data in enumerate(grouped.values()):
+        if keep_ids is not None and f"river:{group_idx}" not in keep_ids:
+            continue
+        lines = data["lines"]
+        names = [name for name in data["names"] if name]  # type: ignore[index]
+        name = _best_water_name(names, "river")
+        if len(lines) == 1:
+            geom = lines[0]
+        else:
+            try:
+                from shapely.ops import linemerge, unary_union
+                geom = linemerge(unary_union(lines))
+            except Exception:
+                from shapely.geometry import MultiLineString
+                geom = MultiLineString(lines)
+        features.append((geom, name))
+    return features
+
+
+def _load_water_lines_for_bounds(
+    shp_path: Path,
+    *,
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+    keep_ids: Optional[set[str]] = None,
+):
+    return [
+        line
+        for line, _name in _load_water_line_features_for_bounds(
+            shp_path,
+            min_x=min_x,
+            min_y=min_y,
+            max_x=max_x,
+            max_y=max_y,
+            keep_ids=keep_ids,
+        )
+    ]
+
+
+def _is_bridge_record(record_dict: Dict[str, object]) -> bool:
+    for key, value in record_dict.items():
+        key_norm = _normalize_token(key)
+        value_norm = _normalize_token(value)
+        if key_norm == "kunstbaute" and any(token in value_norm for token in ("bruecke", "brucke", "bridge")):
+            return True
+    return False
+
+
+def _load_bridge_geometries(
+    shp_paths: List[Path],
+    *,
+    min_x: Optional[float] = None,
+    min_y: Optional[float] = None,
+    max_x: Optional[float] = None,
+    max_y: Optional[float] = None,
+):
+    try:
+        import shapefile  # pyshp
+        from shapely.geometry import shape as shapely_shape
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Bridge protection requires 'pyshp' and 'shapely'. "
+            "Install with: pip install pyshp shapely"
+        ) from exc
+
+    geoms = []
+    for shp_path in shp_paths:
+        if not shp_path.exists():
+            continue
+        reader = shapefile.Reader(str(shp_path), encoding="latin1", encodingErrors="replace")
+        field_names = [f[0] for f in reader.fields if f[0] != "DeletionFlag"]
+        for shape_record in reader.iterShapeRecords():
+            if min_x is not None and min_y is not None and max_x is not None and max_y is not None:
+                shape_bbox = getattr(shape_record.shape, "bbox", None)
+                if shape_bbox and len(shape_bbox) >= 4:
+                    if not _bounds_intersect(
+                        float(shape_bbox[0]),
+                        float(shape_bbox[1]),
+                        float(shape_bbox[2]),
+                        float(shape_bbox[3]),
+                        float(min_x),
+                        float(min_y),
+                        float(max_x),
+                        float(max_y),
+                    ):
+                        continue
+            record_dict = dict(zip(field_names, shape_record.record))
+            if not _is_bridge_record(record_dict):
+                continue
+            geom = shapely_shape(shape_record.shape.__geo_interface__)
+            if not geom.is_empty:
+                geoms.append(geom)
+    return geoms
+
+
+def _source_bounds_for_model_bounds(model_bounds: Tuple[float, float, float, float], scale: float) -> Tuple[float, float, float, float]:
+    if scale <= 0.0:
+        raise ValueError("Water scale must be > 0.")
+    min_x, min_y, max_x, max_y = model_bounds
+    if scale == 1.0:
+        return (float(min_x), float(min_y), float(max_x), float(max_y))
+    return (
+        float(min_x) / float(scale),
+        float(min_y) / float(scale),
+        float(max_x) / float(scale),
+        float(max_y) / float(scale),
+    )
+
+
+def _prepare_water_geometries(
+    *,
+    lake_shp: Optional[Path],
+    river_shp: Optional[Path],
+    bridge_shps: List[Path],
+    water_scale: float,
+    river_width_mm: float,
+    bridge_buffer_mm: float,
+    model_bounds: Tuple[float, float, float, float],
+    water_feature_ids: Optional[set[str]] = None,
+):
+    if water_scale <= 0.0:
+        raise ValueError("Water scale must be > 0.")
+
+    water_geoms = []
+    bridge_geoms = []
+    src_min_x, src_min_y, src_max_x, src_max_y = _source_bounds_for_model_bounds(model_bounds, float(water_scale))
+
+    if lake_shp is not None:
+        lake_geoms = _load_lake_geometries_for_bounds(
+            lake_shp,
+            min_x=src_min_x,
+            min_y=src_min_y,
+            max_x=src_max_x,
+            max_y=src_max_y,
+            keep_ids=water_feature_ids,
+        )
+        for geom in lake_geoms:
+            water_geoms.append(_scale_border_geometry(geom, water_scale) if water_scale != 1.0 else geom)
+        print(f"[WATER] Loaded {len(lake_geoms):,} lake polygon feature(s) for model bounds")
+
+    if river_shp is not None:
+        river_lines = _load_water_lines_for_bounds(
+            river_shp,
+            min_x=src_min_x,
+            min_y=src_min_y,
+            max_x=src_max_x,
+            max_y=src_max_y,
+            keep_ids=water_feature_ids,
+        )
+        line_buffer = max(float(river_width_mm), 0.0) / 2.0
+        if line_buffer <= 0.0:
+            raise ValueError("River width must be > 0 when river detection is enabled.")
+        for line in river_lines:
+            geom_scaled = _scale_border_geometry(line, water_scale) if water_scale != 1.0 else line
+            water_geoms.append(geom_scaled.buffer(line_buffer, cap_style=2, join_style=2))
+        print(
+            f"[WATER] Loaded {len(river_lines):,} river line feature(s) for model bounds "
+            f"with {float(river_width_mm):.3f} mm width"
+        )
+
+    if river_shp is not None and bridge_shps:
+        bridge_buffer = max(float(bridge_buffer_mm), 0.0) / 2.0
+        if bridge_buffer > 0.0:
+            raw_bridges = _load_bridge_geometries(
+                bridge_shps,
+                min_x=src_min_x,
+                min_y=src_min_y,
+                max_x=src_max_x,
+                max_y=src_max_y,
+            )
+            for geom in raw_bridges:
+                geom_scaled = _scale_border_geometry(geom, water_scale) if water_scale != 1.0 else geom
+                bridge_geoms.append(geom_scaled.buffer(bridge_buffer, cap_style=2, join_style=2))
+            print(
+                f"[WATER] Loaded {len(raw_bridges):,} bridge protection feature(s) "
+                f"with {float(bridge_buffer_mm):.3f} mm buffer"
+            )
+
+    return water_geoms, bridge_geoms
+
+
+def _combined_xy_mask(geoms: List[object], xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
+    flat_x = np.asarray(xs, dtype=np.float64).ravel()
+    flat_y = np.asarray(ys, dtype=np.float64).ravel()
+    mask = np.zeros(flat_x.shape[0], dtype=bool)
+    if not geoms or flat_x.size == 0:
+        return mask.reshape(np.shape(xs))
+
+    for geom in geoms:
+        bounds = geom.bounds
+        bbox_mask = (
+            (flat_x >= bounds[0]) &
+            (flat_x <= bounds[2]) &
+            (flat_y >= bounds[1]) &
+            (flat_y <= bounds[3])
+        )
+        candidate_idx = np.flatnonzero(bbox_mask & ~mask)
+        if candidate_idx.size == 0:
+            continue
+        local_mask = _geometry_xy_mask(geom, flat_x[candidate_idx], flat_y[candidate_idx]).ravel()
+        if np.any(local_mask):
+            mask[candidate_idx[local_mask]] = True
+    return mask.reshape(np.shape(xs))
+
+
+def _triangle_intersection_mask(geoms: List[object], tri_vertices: np.ndarray) -> np.ndarray:
+    mask = np.zeros(tri_vertices.shape[0], dtype=bool)
+    if not geoms or tri_vertices.shape[0] == 0:
+        return mask
+
+    try:
+        from shapely.geometry import Polygon
+        from shapely.prepared import prep
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Water removal requires 'shapely'. Install with: pip install shapely"
+        ) from exc
+
+    tri_min_x = tri_vertices[:, :, 0].min(axis=1)
+    tri_max_x = tri_vertices[:, :, 0].max(axis=1)
+    tri_min_y = tri_vertices[:, :, 1].min(axis=1)
+    tri_max_y = tri_vertices[:, :, 1].max(axis=1)
+
+    for geom in geoms:
+        bounds = geom.bounds
+        candidate_idx = np.flatnonzero(
+            ~mask
+            & (tri_max_x >= bounds[0])
+            & (tri_min_x <= bounds[2])
+            & (tri_max_y >= bounds[1])
+            & (tri_min_y <= bounds[3])
+        )
+        if candidate_idx.size == 0:
+            continue
+        prepared = prep(geom)
+        for idx in candidate_idx:
+            triangle = Polygon(
+                (
+                    (float(tri_vertices[idx, 0, 0]), float(tri_vertices[idx, 0, 1])),
+                    (float(tri_vertices[idx, 1, 0]), float(tri_vertices[idx, 1, 1])),
+                    (float(tri_vertices[idx, 2, 0]), float(tri_vertices[idx, 2, 1])),
+                )
+            )
+            if triangle.is_valid and not triangle.is_empty and prepared.intersects(triangle):
+                mask[idx] = True
+    return mask
+
+
+def _compact_mesh(mesh: Mesh) -> Mesh:
+    used = np.unique(mesh.faces.ravel())
+    remap = np.full(mesh.vertices.shape[0], -1, dtype=np.int64)
+    remap[used] = np.arange(used.shape[0], dtype=np.int64)
+    return Mesh(vertices=mesh.vertices[used], faces=remap[mesh.faces])
+
+
+def _apply_water_adjustment_to_mesh(
+    mesh: Mesh,
+    *,
+    mode: str,
+    water_geoms: List[object],
+    bridge_geoms: List[object],
+    amount_mm: float,
+) -> Mesh:
+    mode = mode.strip().lower()
+    if mode == "off" or not water_geoms:
+        return mesh
+    if mode not in {"lower", "remove"}:
+        raise ValueError("Water mode must be one of: off, lower, remove.")
+
+    vertices = mesh.vertices
+    if mode == "lower":
+        water_mask = _combined_xy_mask(water_geoms, vertices[:, 0], vertices[:, 1]).ravel()
+        if bridge_geoms:
+            water_mask &= ~_combined_xy_mask(bridge_geoms, vertices[:, 0], vertices[:, 1]).ravel()
+        lowered_count = int(water_mask.sum())
+        if lowered_count == 0:
+            print("[WATER] No lake or river vertices intersect the merged model bounds.")
+            return mesh
+        out_vertices = vertices.copy()
+        out_vertices[water_mask, 2] -= float(amount_mm)
+        print(f"[WATER] Lowered {lowered_count:,} vertex/vertices by {float(amount_mm):.3f} mm")
+        return Mesh(vertices=out_vertices, faces=mesh.faces)
+
+    tri_vertices = vertices[mesh.faces]
+    remove_mask = _triangle_intersection_mask(water_geoms, tri_vertices)
+    if bridge_geoms:
+        bridge_mask = _triangle_intersection_mask(bridge_geoms, tri_vertices)
+        remove_mask &= ~bridge_mask
+    remove_count = int(remove_mask.sum())
+    if remove_count == 0:
+        print("[WATER] No lake or river faces intersect the merged model bounds.")
+        return mesh
+    kept_faces = mesh.faces[~remove_mask]
+    print(f"[WATER] Removed {remove_count:,}/{mesh.faces.shape[0]:,} face(s) for water cutouts")
+    return _compact_mesh(Mesh(vertices=mesh.vertices, faces=kept_faces))
 
 
 def _geometry_xy_mask(geom, xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
@@ -1916,9 +2525,16 @@ def merge_stls_mesh(
     base_z_value: Optional[float],
     base_mode: str,
     z_scale: float,
-    lake_lower_mm: float = 0.0,
+    water_mode: str = "off",
+    water_lower_mm: float = 0.0,
     lake_shp: Optional[Path] = None,
-    lake_scale: float = 1.0,
+    river_shp: Optional[Path] = None,
+    bridge_shps: Optional[List[Path]] = None,
+    water_scale: float = 1.0,
+    river_width_mm: float = 0.8,
+    bridge_buffer_mm: float = 1.2,
+    water_feature_ids: Optional[set[str]] = None,
+    clean_tiles_after_merge: bool = False,
     clip_border: bool = False,
     border_geom=None,
 ) -> None:
@@ -2021,13 +2637,32 @@ def merge_stls_mesh(
     if z_scale != 1.0:
         merged = scale_mesh_z(merged, float(z_scale))
 
-    if lake_shp is not None and float(lake_lower_mm) > 0.0:
-        print(f"[LAKES] Applying merged lake lowering: {float(lake_lower_mm):.3f} mm")
-        merged = _apply_lake_lowering_to_mesh(
+    if water_mode != "off":
+        model_bounds = (
+            float(merged.vertices[:, 0].min()),
+            float(merged.vertices[:, 1].min()),
+            float(merged.vertices[:, 0].max()),
+            float(merged.vertices[:, 1].max()),
+        )
+        water_geoms, bridge_geoms = _prepare_water_geometries(
+            lake_shp=lake_shp,
+            river_shp=river_shp,
+            bridge_shps=list(bridge_shps or []),
+            water_scale=float(water_scale),
+            river_width_mm=float(river_width_mm),
+            bridge_buffer_mm=float(bridge_buffer_mm),
+            model_bounds=model_bounds,
+            water_feature_ids=water_feature_ids,
+        )
+        if not water_geoms:
+            print("[WATER] No lake or river geometry found.")
+        print(f"[WATER] Applying merged water mode: {water_mode}")
+        merged = _apply_water_adjustment_to_mesh(
             merged,
-            lake_shp,
-            lake_scale=float(lake_scale),
-            amount_mm=float(lake_lower_mm),
+            mode=str(water_mode),
+            water_geoms=water_geoms,
+            bridge_geoms=bridge_geoms,
+            amount_mm=float(water_lower_mm),
         )
 
     if make_solid_flag:
@@ -2045,6 +2680,8 @@ def merge_stls_mesh(
         write_ascii_stl(merged, out_stl, solid_name=solid_name)
 
     print(f"[MERGE-MESH] Done. Wrote {out_stl}")
+    if clean_tiles_after_merge:
+        _clear_tiles_dir()
 
 
 # ----------------------------
@@ -2113,13 +2750,64 @@ def main() -> None:
         "--lake-lower-mm",
         type=float,
         default=0.0,
-        help="Lower merged lake surfaces by this amount in final STL units (mm). Requires --merge-stl.",
+        help="Backward-compatible alias for --water-mode lower --water-lower-mm.",
     )
     ap.add_argument(
         "--lake-shp",
         type=Path,
         default=None,
         help="Path to a lake polygon .shp file used during merge (default: auto-detect standing water in ./geometry_data).",
+    )
+    ap.add_argument(
+        "--water-mode",
+        type=str,
+        default="off",
+        choices=["off", "lower", "remove"],
+        help="Water treatment during merge: off, lower lake/river surfaces, or remove them as cutouts.",
+    )
+    ap.add_argument(
+        "--water-features",
+        type=str,
+        default="lakes,rivers",
+        help="Comma-separated water feature classes to affect: lakes, rivers, or lakes,rivers (default).",
+    )
+    ap.add_argument(
+        "--water-feature-ids",
+        type=str,
+        default="",
+        help="Optional comma-separated selected water feature IDs from the GUI, e.g. lake:0,river:3. Default: all.",
+    )
+    ap.add_argument(
+        "--water-lower-mm",
+        type=float,
+        default=0.0,
+        help="Lower lake and river surfaces by this amount in final STL units (mm). Requires --water-mode lower.",
+    )
+    ap.add_argument(
+        "--river-shp",
+        type=Path,
+        default=None,
+        help="Path to a river centerline .shp file (default: auto-detect TLM_FLIESSGEWAESSER in ./geometry_data).",
+    )
+    ap.add_argument(
+        "--river-width-mm",
+        type=float,
+        default=0.8,
+        help="Final-model width used to buffer river centerlines for lowering/removal (default: 0.8 mm).",
+    )
+    ap.add_argument(
+        "--bridge-shp",
+        type=Path,
+        action="append",
+        default=[],
+        help="Transport .shp file with KUNSTBAUTE bridge attributes to protect from water lowering/removal. "
+             "May be passed more than once; defaults to auto-detected road/rail layers.",
+    )
+    ap.add_argument(
+        "--bridge-buffer-mm",
+        type=float,
+        default=1.2,
+        help="Final-model width used to protect bridge features from water lowering/removal (default: 1.2 mm).",
     )
     ap.add_argument(
         "--merge-z-scale",
@@ -2236,6 +2924,11 @@ def main() -> None:
         action="store_true",
         help="Delete existing files in ./output/tiles before converting.",
     )
+    ap.add_argument(
+        "--clean-tiles-after-merge",
+        action="store_true",
+        help="Delete intermediate files in ./output/tiles after a successful --merge-stl run.",
+    )
 
     args = ap.parse_args()
 
@@ -2254,8 +2947,29 @@ def main() -> None:
     if scale_mode_count > 1:
         ap.error("Use only one of --target-size-mm, --tile-size-mm, or --scale-ratio.")
 
-    if float(args.lake_lower_mm) > 0.0 and args.merge_stl is None:
-        ap.error("--lake-lower-mm can only be used with --merge-stl.")
+    if float(args.lake_lower_mm) > 0.0:
+        if args.water_mode != "off" and args.water_mode != "lower":
+            ap.error("--lake-lower-mm cannot be combined with --water-mode remove.")
+        args.water_mode = "lower"
+        if float(args.water_lower_mm) <= 0.0:
+            args.water_lower_mm = float(args.lake_lower_mm)
+
+    try:
+        include_lakes, include_rivers = _parse_water_features(str(args.water_features))
+        water_feature_ids = _parse_water_feature_ids(str(args.water_feature_ids))
+    except ValueError as exc:
+        ap.error(str(exc))
+
+    if args.water_mode != "off" and args.merge_stl is None:
+        ap.error("--water-mode can only be used with --merge-stl.")
+    if args.water_mode != "off" and not (include_lakes or include_rivers):
+        ap.error("--water-mode requires at least one --water-features value: lakes or rivers.")
+    if args.water_mode == "lower" and float(args.water_lower_mm) <= 0.0:
+        ap.error("--water-mode lower requires --water-lower-mm > 0.")
+    if args.water_mode != "off" and float(args.river_width_mm) <= 0.0:
+        ap.error("--river-width-mm must be > 0.")
+    if args.water_mode != "off" and float(args.bridge_buffer_mm) < 0.0:
+        ap.error("--bridge-buffer-mm must be >= 0.")
 
     try:
         crop_rect = _parse_crop_rect(args.crop_rect)
@@ -2268,7 +2982,9 @@ def main() -> None:
     if args.merge_stl is not None:
         border_geom = None
         lake_shp = None
-        lake_scale = 1.0
+        river_shp = None
+        bridge_shps: List[Path] = []
+        water_scale = 1.0
         if args.clip_border:
             border_path = args.border_shp or _default_border_shp()
             if border_path is None:
@@ -2288,13 +3004,30 @@ def main() -> None:
                 print(f"[BORDER] Scaling border by {border_scale:.6f}")
                 border_geom = _scale_border_geometry(border_geom, float(border_scale))
 
-        if float(args.lake_lower_mm) > 0.0:
-            lake_shp = args.lake_shp or _default_lake_shp()
-            if lake_shp is None:
-                ap.error("--lake-lower-mm requested but no standing-water shapefile was found in ./geometry_data.")
-            lake_scale = _parse_border_scale("auto", Path("./output/tiles"))
-            print(f"[LAKES] Using lake polygons from {lake_shp}")
-            print(f"[LAKES] Using XY scale {lake_scale:.6f} for merged lake matching")
+        if args.water_mode != "off":
+            if include_lakes:
+                lake_shp = args.lake_shp or _default_lake_shp()
+            if include_lakes and lake_shp is None:
+                ap.error("--water-mode requested but no standing-water shapefile was found in ./geometry_data.")
+            if include_rivers:
+                river_shp = args.river_shp or _default_river_shp()
+            if include_rivers and river_shp is None:
+                ap.error("--water-mode requested but no river shapefile was found in ./geometry_data.")
+            bridge_shps = list(args.bridge_shp or []) or _default_bridge_shps()
+            water_scale = _parse_border_scale("auto", Path("./output/tiles"))
+            if lake_shp is not None:
+                print(f"[WATER] Using lake polygons from {lake_shp}")
+            else:
+                print("[WATER] Lake features disabled")
+            if river_shp is not None:
+                print(f"[WATER] Using river centerlines from {river_shp}")
+            else:
+                print("[WATER] River features disabled")
+            if bridge_shps:
+                print(f"[WATER] Protecting bridges from {len(bridge_shps)} shapefile(s)")
+            else:
+                print("[WATER] No bridge shapefiles found; river/lake treatment will not preserve bridges.")
+            print(f"[WATER] Using XY scale {water_scale:.6f} for merged water matching")
 
         # Load + weld for seamless joins; solidify once globally if requested.
         merge_name = args.model_name.strip() or "terrain_merged"
@@ -2308,9 +3041,16 @@ def main() -> None:
             base_z_value=args.base_z,
             base_mode=str(args.base_mode),
             z_scale=float(args.merge_z_scale),
-            lake_lower_mm=float(args.lake_lower_mm),
+            water_mode=str(args.water_mode),
+            water_lower_mm=float(args.water_lower_mm),
             lake_shp=lake_shp,
-            lake_scale=float(lake_scale),
+            river_shp=river_shp,
+            bridge_shps=bridge_shps,
+            water_scale=float(water_scale),
+            river_width_mm=float(args.river_width_mm),
+            bridge_buffer_mm=float(args.bridge_buffer_mm),
+            water_feature_ids=water_feature_ids,
+            clean_tiles_after_merge=bool(args.clean_tiles_after_merge),
             clip_border=bool(args.clip_border),
             border_geom=border_geom,
         )
@@ -2485,3 +3225,4 @@ if __name__ == "__main__":
     main()
 
     
+

@@ -109,6 +109,9 @@ class App(tk.Tk):
         self.border_keep_var = tk.StringVar(value="")
         self.border_keep_options: list[str] = []
         self.border_keep_all_label = "(all touched)"
+        self.water_feature_options: list[str] = []
+        self.water_feature_ids_by_label: dict[str, str] = {}
+        self.water_feature_all_label = "(all touched water)"
         self.pending_commands: list[tuple[list[str], str, str]] = []
         self.pipeline_running = False
 
@@ -265,8 +268,8 @@ class App(tk.Tk):
             canvas.yview_scroll(3, "units")
 
     def _on_listbox_mousewheel(self, event: tk.Event) -> str:
-        listbox = self.border_keep_list
-        if listbox is None:
+        listbox = event.widget
+        if not isinstance(listbox, tk.Listbox):
             return "break"
         if hasattr(event, "delta") and event.delta:
             listbox.yview_scroll(int(-1 * (event.delta / 120)), "units")
@@ -722,6 +725,13 @@ class App(tk.Tk):
         self.weld_tol_var = tk.StringVar(value=DEFAULTS["weld_tolerance"])
         self.merge_z_scale_var = tk.StringVar(value=DEFAULTS["merge_z_scale"])
         self.merge_lake_lower_mm_var = tk.StringVar(value=DEFAULTS["merge_lake_lower_mm"])
+        self.water_mode_var = tk.StringVar(value=DEFAULTS["water_mode"])
+        self.water_include_lakes_var = tk.BooleanVar(value=DEFAULTS["water_include_lakes"])
+        self.water_include_rivers_var = tk.BooleanVar(value=DEFAULTS["water_include_rivers"])
+        self.water_lower_mm_var = tk.StringVar(value=DEFAULTS["water_lower_mm"])
+        self.river_width_mm_var = tk.StringVar(value=DEFAULTS["river_width_mm"])
+        self.bridge_buffer_mm_var = tk.StringVar(value=DEFAULTS["bridge_buffer_mm"])
+        self.clean_tiles_after_merge_var = tk.BooleanVar(value=DEFAULTS["clean_tiles_after_merge"])
         self.make_solid_var = tk.BooleanVar(value=DEFAULTS["make_solid"])
         self.base_mode_var = tk.StringVar(value=DEFAULTS["base_mode"])
         self.base_thickness_var = tk.StringVar(value=DEFAULTS["base_thickness"])
@@ -771,14 +781,97 @@ class App(tk.Tk):
         self.base_thickness_label.grid(row=2, column=0, sticky=tk.W, pady=4)
         self.base_thickness_entry = ttk.Entry(base_frame, textvariable=self.base_thickness_var, width=10)
         self.base_thickness_entry.grid(row=2, column=1, sticky=tk.W, padx=(8, 0))
+        clean_tiles_chk = ttk.Checkbutton(
+            base_frame,
+            text="Clean tile STLs after merge",
+            variable=self.clean_tiles_after_merge_var,
+            command=self._refresh_ui_state,
+        )
+        clean_tiles_chk.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0))
         base_frame.columnconfigure(2, weight=1)
 
         surface_frame = ttk.LabelFrame(merge_options, text="Surface Adjustments")
         surface_frame.grid(row=0, column=1, sticky=tk.NSEW, padx=(6, 0))
-        self.merge_lake_lower_label = ttk.Label(surface_frame, text="Lake lowering (mm):")
-        self.merge_lake_lower_label.grid(row=0, column=0, sticky=tk.W, pady=4)
-        self.merge_lake_lower_entry = ttk.Entry(surface_frame, textvariable=self.merge_lake_lower_mm_var, width=10)
-        self.merge_lake_lower_entry.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+        water_mode_label = ttk.Label(surface_frame, text="Water treatment:")
+        water_mode_label.grid(row=0, column=0, sticky=tk.W, pady=4)
+        self.water_mode_combo = ttk.Combobox(
+            surface_frame,
+            textvariable=self.water_mode_var,
+            values=["off", "lower", "remove"],
+            state="readonly",
+            width=10,
+        )
+        self.water_mode_combo.grid(row=0, column=1, sticky=tk.W, padx=(8, 0))
+        self.water_mode_combo.bind("<<ComboboxSelected>>", lambda _e: self._on_water_options_change())
+
+        self.water_features_label = ttk.Label(surface_frame, text="Water features:")
+        self.water_features_label.grid(row=1, column=0, sticky=tk.W, pady=4)
+        self.water_lakes_check = ttk.Checkbutton(
+            surface_frame,
+            text="Lakes",
+            variable=self.water_include_lakes_var,
+            command=self._on_water_options_change,
+        )
+        self.water_lakes_check.grid(row=1, column=1, sticky=tk.W, padx=(8, 0))
+        self.water_rivers_check = ttk.Checkbutton(
+            surface_frame,
+            text="Rivers",
+            variable=self.water_include_rivers_var,
+            command=self._on_water_options_change,
+        )
+        self.water_rivers_check.grid(row=1, column=2, sticky=tk.W, padx=(8, 0))
+
+        self.water_lower_label = ttk.Label(surface_frame, text="Lower by (mm):")
+        self.water_lower_label.grid(row=2, column=0, sticky=tk.W, pady=4)
+        self.water_lower_entry = ttk.Entry(surface_frame, textvariable=self.water_lower_mm_var, width=10)
+        self.water_lower_entry.grid(row=2, column=1, sticky=tk.W, padx=(8, 0))
+
+        self.river_width_label = ttk.Label(surface_frame, text="River width (mm):")
+        self.river_width_label.grid(row=3, column=0, sticky=tk.W, pady=4)
+        self.river_width_entry = ttk.Entry(surface_frame, textvariable=self.river_width_mm_var, width=10)
+        self.river_width_entry.grid(row=3, column=1, sticky=tk.W, padx=(8, 0))
+
+        self.bridge_buffer_label = ttk.Label(surface_frame, text="Bridge protect (mm):")
+        self.bridge_buffer_label.grid(row=4, column=0, sticky=tk.W, pady=4)
+        self.bridge_buffer_entry = ttk.Entry(surface_frame, textvariable=self.bridge_buffer_mm_var, width=10)
+        self.bridge_buffer_entry.grid(row=4, column=1, sticky=tk.W, padx=(8, 0))
+
+        self.water_pick_label = ttk.Label(surface_frame, text="Specific water:")
+        self.water_pick_label.grid(row=5, column=0, sticky=tk.NW, pady=4)
+        water_feature_frame = ttk.Frame(surface_frame)
+        water_feature_frame.grid(row=5, column=1, columnspan=2, sticky=tk.EW, padx=(8, 12))
+        self.water_feature_list = tk.Listbox(
+            water_feature_frame,
+            selectmode=tk.MULTIPLE,
+            height=5,
+            exportselection=False,
+            bg="#0b1220",
+            fg="#e2e8f0",
+            highlightthickness=1,
+            highlightbackground="#1f2937",
+            selectbackground="#2563eb",
+            selectforeground="#f8fafc",
+        )
+        self.water_feature_scrollbar = ttk.Scrollbar(
+            water_feature_frame,
+            orient=tk.VERTICAL,
+            command=self.water_feature_list.yview,
+        )
+        self.water_feature_list.configure(yscrollcommand=self.water_feature_scrollbar.set)
+        self.water_feature_list.grid(row=0, column=0, sticky=tk.NSEW)
+        self.water_feature_scrollbar.grid(row=0, column=1, sticky=tk.NS)
+        water_feature_frame.columnconfigure(0, weight=1)
+        self.water_feature_list.bind("<MouseWheel>", self._on_listbox_mousewheel)
+        self.water_feature_list.bind("<Button-4>", self._on_listbox_mousewheel)
+        self.water_feature_list.bind("<Button-5>", self._on_listbox_mousewheel)
+        self.water_feature_list.bind("<<ListboxSelect>>", self._on_water_feature_select)
+        self.water_feature_refresh_btn = ttk.Button(
+            surface_frame,
+            text="Detect touched",
+            command=self._refresh_water_feature_options,
+        )
+        self.water_feature_refresh_btn.grid(row=5, column=3, pady=2, sticky=tk.NW)
+        surface_frame.columnconfigure(2, weight=1)
         merge_options.columnconfigure(0, weight=1)
         merge_options.columnconfigure(1, weight=1)
 
@@ -915,8 +1008,40 @@ class App(tk.Tk):
                 "Used with fixed base. Sets how far below the terrain the base sits.",
             ),
             Tooltip(
-                self.merge_lake_lower_entry,
-                "Lower detected lake surfaces by this many millimeters in the final model.",
+                clean_tiles_chk,
+                "Deletes intermediate files in output/tiles after the final STL is written.",
+            ),
+            Tooltip(
+                self.water_mode_combo,
+                "Lower lakes and rivers, or remove them as cutouts for a contrasting backing sheet.",
+            ),
+            Tooltip(
+                self.water_lakes_check,
+                "Include lake and other standing-water features in the selected water treatment.",
+            ),
+            Tooltip(
+                self.water_rivers_check,
+                "Include flowing-water river centerlines in the selected water treatment.",
+            ),
+            Tooltip(
+                self.water_feature_list,
+                "Specific touched lake and river features to treat. Select all, or pick individual entries.",
+            ),
+            Tooltip(
+                self.water_feature_refresh_btn,
+                "Detect lake and river features that intersect the current STL tiles.",
+            ),
+            Tooltip(
+                self.water_lower_entry,
+                "Used in lower mode. Moves detected lake and river vertices down by this amount.",
+            ),
+            Tooltip(
+                self.river_width_entry,
+                "Final-model width used to buffer river centerlines.",
+            ),
+            Tooltip(
+                self.bridge_buffer_entry,
+                "Final-model width protected around road and rail bridge features.",
             ),
             Tooltip(
                 border_mode_label,
@@ -1318,6 +1443,138 @@ class App(tk.Tk):
             else:
                 self.border_keep_list.selection_clear(all_index)
 
+    def _water_feature_label(self, prefix: str, index: int, geom, name: str = "") -> str:
+        display_name = ""
+        if name:
+            parts = [part.strip() for part in str(name).split("|") if part.strip()]
+            display_name = " / ".join(parts[:2]) if parts else str(name).strip()
+            if len(display_name) > 72:
+                display_name = display_name[:69].rstrip() + "..."
+        try:
+            center = geom.centroid
+            x = float(center.x)
+            y = float(center.y)
+            bounds = geom.bounds
+            width = max(float(bounds[2]) - float(bounds[0]), float(bounds[3]) - float(bounds[1]))
+            label = f"{prefix.title()} {index + 1}"
+            if display_name:
+                label += f" - {display_name}"
+            return f"{label} - center {x:.1f}, {y:.1f} - size {width:.1f} mm"
+        except Exception:
+            label = f"{prefix.title()} {index + 1}"
+            if display_name:
+                label += f" - {display_name}"
+            return label
+
+    def _refresh_water_feature_options(self) -> None:
+        if self.water_mode_var.get().strip() == "off":
+            return
+
+        try:
+            import build_stl
+        except Exception as exc:
+            messagebox.showerror("Water selection failed", str(exc))
+            return
+
+        try:
+            tile_union = self._collect_tile_union()
+        except Exception as exc:
+            messagebox.showerror("Missing dependency", str(exc))
+            return
+
+        if tile_union is None:
+            messagebox.showwarning(
+                "No tiles found",
+                "No STL tiles were found in output/tiles. Convert tiles first.",
+            )
+            return
+
+        try:
+            water_scale = self._parse_border_scale("auto")
+            src_bounds = build_stl._source_bounds_for_model_bounds(tile_union.bounds, water_scale)
+            labels: list[str] = []
+            ids_by_label: dict[str, str] = {}
+
+            if self.water_include_lakes_var.get():
+                lake_path = build_stl._default_lake_shp()
+                if lake_path is None:
+                    raise RuntimeError("No standing-water shapefile was found in geometry_data.")
+                lake_features = build_stl._load_lake_features_for_bounds(
+                    lake_path,
+                    min_x=src_bounds[0],
+                    min_y=src_bounds[1],
+                    max_x=src_bounds[2],
+                    max_y=src_bounds[3],
+                )
+                for idx, (geom, name) in enumerate(lake_features):
+                    geom_model = build_stl._scale_border_geometry(geom, water_scale) if water_scale != 1.0 else geom
+                    label = self._water_feature_label("lake", idx, geom_model, name)
+                    labels.append(label)
+                    ids_by_label[label] = f"lake:{idx}"
+
+            if self.water_include_rivers_var.get():
+                river_path = build_stl._default_river_shp()
+                if river_path is None:
+                    raise RuntimeError("No river shapefile was found in geometry_data.")
+                river_features = build_stl._load_water_line_features_for_bounds(
+                    river_path,
+                    min_x=src_bounds[0],
+                    min_y=src_bounds[1],
+                    max_x=src_bounds[2],
+                    max_y=src_bounds[3],
+                )
+                for idx, (line, name) in enumerate(river_features):
+                    geom_model = build_stl._scale_border_geometry(line, water_scale) if water_scale != 1.0 else line
+                    label = self._water_feature_label("river", idx, geom_model, name)
+                    labels.append(label)
+                    ids_by_label[label] = f"river:{idx}"
+        except Exception as exc:
+            messagebox.showerror("Water selection failed", str(exc))
+            return
+
+        if not labels:
+            messagebox.showwarning(
+                "No touched water",
+                "No selected lake or river features intersect the current tiles.",
+            )
+            self.water_feature_options = []
+            self.water_feature_ids_by_label = {}
+            self.water_feature_list.delete(0, tk.END)
+            return
+
+        self.water_feature_options = [self.water_feature_all_label] + labels
+        self.water_feature_ids_by_label = ids_by_label
+        self.water_feature_list.delete(0, tk.END)
+        for item in self.water_feature_options:
+            self.water_feature_list.insert(tk.END, item)
+        self.water_feature_list.selection_set(0)
+        self._refresh_ui_state()
+
+    def _on_water_feature_select(self, _event: tk.Event) -> None:
+        selections = list(self.water_feature_list.curselection())
+        if not selections:
+            return
+        labels = [self.water_feature_list.get(i) for i in selections]
+        if self.water_feature_all_label in labels and len(labels) > 1:
+            all_index = self.water_feature_options.index(self.water_feature_all_label)
+            active_index = self.water_feature_list.index(tk.ACTIVE)
+            if active_index == all_index:
+                for idx in selections:
+                    if idx != all_index:
+                        self.water_feature_list.selection_clear(idx)
+            else:
+                self.water_feature_list.selection_clear(all_index)
+        self._refresh_ui_state()
+
+    def _clear_water_feature_options(self) -> None:
+        self.water_feature_options = []
+        self.water_feature_ids_by_label = {}
+        self.water_feature_list.delete(0, tk.END)
+
+    def _on_water_options_change(self) -> None:
+        self._clear_water_feature_options()
+        self._update_merge_controls()
+
     def _browse_csv(self) -> None:
         path = filedialog.askopenfilename(
             title="Select CSV file",
@@ -1369,10 +1626,41 @@ class App(tk.Tk):
             parts.append("surface only")
         if self.merge_border_mode_var.get() == "clip":
             parts.append("border clipping enabled")
-        lake_lower = self.merge_lake_lower_mm_var.get().strip()
-        if lake_lower and lake_lower != "0" and lake_lower != "0.0":
-            parts.append(f"lakes lowered {lake_lower} mm")
+        if self.clean_tiles_after_merge_var.get():
+            parts.append("cleans tile STLs")
+        water_mode = self.water_mode_var.get().strip()
+        if water_mode == "lower":
+            water_lower = self.water_lower_mm_var.get().strip() or "0"
+            features = self._selected_water_feature_label()
+            parts.append(f"{features} lowered {water_lower} mm")
+        elif water_mode == "remove":
+            features = self._selected_water_feature_label()
+            parts.append(f"{features} cutouts enabled")
+        if water_mode != "off":
+            selected_ids = self._selected_water_feature_ids()
+            if selected_ids is not None:
+                parts.append(f"{len(selected_ids)} selected water feature(s)")
         return "Merge setup: " + ", ".join(parts) + "."
+
+    def _selected_water_feature_label(self) -> str:
+        include_lakes = self.water_include_lakes_var.get()
+        include_rivers = self.water_include_rivers_var.get()
+        if include_lakes and include_rivers:
+            return "lakes and rivers"
+        if include_lakes:
+            return "lakes"
+        if include_rivers:
+            return "rivers"
+        return "no water"
+
+    def _selected_water_feature_ids(self) -> list[str] | None:
+        if not getattr(self, "water_feature_options", None):
+            return None
+        selections = [self.water_feature_list.get(i) for i in self.water_feature_list.curselection()]
+        if not selections or self.water_feature_all_label in selections:
+            return None
+        ids = [self.water_feature_ids_by_label[label] for label in selections if label in self.water_feature_ids_by_label]
+        return ids or None
 
     def _apply_detail_preset(self) -> None:
         preset = self.detail_preset_var.get().strip()
@@ -1621,9 +1909,37 @@ class App(tk.Tk):
         if merge_z:
             args += ["--merge-z-scale", merge_z]
 
-        lake_lower_mm = self.merge_lake_lower_mm_var.get().strip()
-        if lake_lower_mm:
-            args += ["--lake-lower-mm", lake_lower_mm]
+        if self.clean_tiles_after_merge_var.get():
+            args.append("--clean-tiles-after-merge")
+
+        water_mode = self.water_mode_var.get().strip()
+        if water_mode and water_mode != "off":
+            args += ["--water-mode", water_mode]
+            water_features = []
+            if self.water_include_lakes_var.get():
+                water_features.append("lakes")
+            if self.water_include_rivers_var.get():
+                water_features.append("rivers")
+            if not water_features:
+                messagebox.showwarning(
+                    "No water features selected",
+                    "Select lakes, rivers, or both for water treatment.",
+                )
+                return None
+            args += ["--water-features", ",".join(water_features)]
+            selected_water_ids = self._selected_water_feature_ids()
+            if selected_water_ids:
+                args += ["--water-feature-ids", ",".join(selected_water_ids)]
+            river_width = self.river_width_mm_var.get().strip()
+            if river_width:
+                args += ["--river-width-mm", river_width]
+            bridge_buffer = self.bridge_buffer_mm_var.get().strip()
+            if bridge_buffer:
+                args += ["--bridge-buffer-mm", bridge_buffer]
+            if water_mode == "lower":
+                water_lower = self.water_lower_mm_var.get().strip()
+                if water_lower:
+                    args += ["--water-lower-mm", water_lower]
 
         if self.make_solid_var.get():
             args.append("--make-solid")
@@ -1837,6 +2153,9 @@ class App(tk.Tk):
     def _update_merge_controls(self) -> None:
         make_solid = self.make_solid_var.get()
         base_mode = self.base_mode_var.get()
+        water_mode = self.water_mode_var.get().strip()
+        if water_mode == "remove" and not self.water_include_lakes_var.get() and not self.water_include_rivers_var.get():
+            self.water_include_lakes_var.set(True)
         border_mode = self.merge_border_mode_var.get()
         border_available = bool(self.border_options)
         clip_border = border_mode == "clip" and border_available
@@ -1862,6 +2181,26 @@ class App(tk.Tk):
             self.base_thickness_entry.configure(state="disabled")
             self.base_mode_label.configure(foreground="#6b7280")
             self.base_thickness_label.configure(foreground="#6b7280")
+
+        water_enabled = water_mode in {"lower", "remove"}
+        lower_enabled = water_mode == "lower"
+        rivers_enabled = water_enabled and self.water_include_rivers_var.get()
+        self.water_lower_entry.configure(state="normal" if lower_enabled else "disabled")
+        self.water_lakes_check.configure(state="normal" if water_enabled else "disabled")
+        self.water_rivers_check.configure(state="normal" if water_enabled else "disabled")
+        self.river_width_entry.configure(state="normal" if rivers_enabled else "disabled")
+        self.bridge_buffer_entry.configure(state="normal" if rivers_enabled else "disabled")
+        self.water_feature_list.configure(state="normal" if water_enabled else "disabled")
+        self.water_feature_refresh_btn.configure(state="normal" if water_enabled else "disabled")
+        self.water_features_label.configure(foreground="#e2e8f0" if water_enabled else "#6b7280")
+        self.water_lower_label.configure(foreground="#e2e8f0" if lower_enabled else "#6b7280")
+        self.river_width_label.configure(foreground="#e2e8f0" if rivers_enabled else "#6b7280")
+        self.bridge_buffer_label.configure(foreground="#e2e8f0" if rivers_enabled else "#6b7280")
+        self.water_pick_label.configure(foreground="#e2e8f0" if water_enabled else "#6b7280")
+        if not water_enabled:
+            self.water_feature_options = []
+            self.water_feature_ids_by_label = {}
+            self.water_feature_list.delete(0, tk.END)
 
         if self.show_merge_advanced_var.get():
             self.merge_advanced_frame.grid()

@@ -16,7 +16,7 @@ Source page:
 https://www.swisstopo.admin.ch/de/hoehenmodell-swissalti3d
 ```
 
-This project is built around the GUI. Use it to download SwissTopo XYZ or GeoTIFF tiles, convert them into STL tiles, and merge them into a single printable STL with optional base, border clipping, and lake lowering.
+This project is built around the GUI. Use it to download SwissTopo XYZ or GeoTIFF tiles, convert them into STL tiles, and merge them into a single printable STL with optional base, border clipping, and water lowering or cutouts.
 
 Prefer GeoTIFF (COG) when available because it is much smaller than ASCII XYZ.
 
@@ -36,7 +36,7 @@ The recommended setup is to use the included Conda environment file:
 environment.yml
 ```
 
-This file records the Python version and the packages needed by the project, including the geospatial libraries used for GeoTIFF input, border clipping, lake lowering, and geometry handling.
+This file records the Python version and the packages needed by the project, including the geospatial libraries used for GeoTIFF input, border clipping, water handling, and geometry handling.
 
 The file is intentionally longer than a normal hand-written requirements list. It was exported from the working `swisstopo-stl` Conda environment, so it includes both the packages used directly by the code and the lower-level native libraries they need, such as GDAL, PROJ, TIFF/PNG/JPEG support, SQLite, OpenSSL, MKL, and Windows runtime packages. This makes the environment more reproducible.
 
@@ -118,7 +118,7 @@ When needed, enable:
 - **Show advanced overrides**
 - **Show advanced merge overrides**
 
-This reveals controls such as manual step size, explicit scale source, grid tolerance, worker count, weld tolerance, merge-only Z scaling, border clipping, and lake lowering.
+This reveals controls such as manual step size, explicit scale source, grid tolerance, worker count, weld tolerance, merge-only Z scaling, border clipping, and water handling.
 
 ---
 
@@ -184,7 +184,7 @@ This step merges all tiles in `output/tiles` into a single STL and can also prep
 - **Add printable base**: creates a watertight solid with walls and a flat bottom
 - **Base thickness**: thickness below the terrain minimum
 - **Base Z (optional)**: explicit base elevation that overrides thickness
-- **Surface adjustments**: lower detected lake surfaces in the merged model
+- **Surface adjustments**: lower or remove selected lake and river surfaces in the merged model
 - **Optional border / region clip**: merge all tiles, or clip to a selected border, canton, or bezirk
 
 ### Advanced merge options
@@ -192,24 +192,60 @@ This step merges all tiles in `output/tiles` into a single STL and can also prep
 - **Weld tolerance**: removes seams between neighboring tiles
 - **Merge Z scale**: applies Z scaling during merge only
 - **Detect touched** and region selection: limit clipping to intersecting canton or bezirk features
+- **Clean tile STLs after merge**: deletes intermediate tile files after the final STL is written
 
-### Lake lowering
+### Water Lowering And Cutouts
 
-The new lake option works during the final merge stage.
+Water handling works during the final merge stage.
 
-- It is available as **Lake lowering (mm)** in the merge section
-- Set it to `0` to disable
-- The tool auto-detects the standing-water shapefile from `./geometry_data`
-- It lowers vertices that fall inside detected lake polygons in the merged model
-- This is useful when you want lakes to read more clearly in the printed terrain
+- It is available as **Water treatment** in the merge section
+- **off** disables water handling
+- **lower** lowers detected lake and river vertices by the configured amount
+- **remove** deletes detected lake and river surface faces, producing cutouts when a printable base is added
+- **Water features** controls whether the operation applies to lakes, rivers, or both
+- **Specific water** works like the border region selector. Click **Detect touched** to list lakes/rivers that intersect the current tiles, leave **(all touched water)** selected for every touched feature, or select individual lake/river rows to affect only those.
+- Lakes come from `TLM_STEHENDES_GEWAESSER`
+- The pruning helper also builds `TLM_LAKE_POLYGONS`, and the app prefers it for lake removal so large lakes are removed as full polygons instead of shoreline fragments
+- Rivers come from `TLM_FLIESSGEWAESSER`, are grouped by SwissTopo watercourse ID, and are buffered with **River width (mm)** in final model units
+- River/lake rows show the official SwissTopo `NAME` when present. If SwissTopo does not provide a name for that feature, the GUI shows a fallback such as `Unnamed river 102102`.
+- Bridges are protected from river lowering/removal using road and railway features whose `KUNSTBAUTE` value is a bridge
+
+For the black-cardboard workflow, use **Water treatment: remove** together with **Add printable base** and leave **Lakes** selected. The merge removes selected water faces before the base is generated, so the solidifier creates side walls around those openings and leaves through-holes for the backing sheet to show through.
+
+The current official SwissTopo source is swissTLM3D from the SwissTopo OGD download page:
+
+```text
+https://ogd.swisstopo.admin.ch/ch.swisstopo.swisstlm3d?lang=en
+```
+
+Download the current `swisstlm3d_..._2056_5728.shp.zip` package and extract these layers under `./geometry_data`:
+
+```text
+TLM_GEWAESSER/swissTLM3D_TLM_STEHENDES_GEWAESSER.*
+TLM_GEWAESSER/swissTLM3D_TLM_FLIESSGEWAESSER.*
+TLM_STRASSEN/swissTLM3D_TLM_STRASSE.*
+TLM_OEV/swissTLM3D_TLM_EISENBAHN.*
+```
+
+After extraction, run the geometry pruning helper to keep disk use low. It creates a lake polygon layer, creates a compact bridge-only layer, deletes the full road/rail sources, removes unused SwissTLM3D layers, and keeps the water DBF files so lake and river names can be shown in the GUI:
+
+```bash
+python tools/prune_geometry_data.py
+```
 
 For the CLI, the same feature is exposed with:
 
 ```bash
-python build_stl.py --merge-stl output/terrain.stl --lake-lower-mm 1.2
+python build_stl.py --merge-stl output/terrain.stl --water-mode lower --water-lower-mm 1.2
+python build_stl.py --merge-stl output/terrain.stl --water-mode remove --river-width-mm 0.8
+python build_stl.py --merge-stl output/terrain.stl --water-mode remove --water-features lakes,rivers --river-width-mm 0.8
+python build_stl.py --merge-stl output/terrain.stl --water-mode remove --water-features lakes --make-solid
+python build_stl.py --merge-stl output/terrain.stl --water-mode remove --water-features lakes --water-feature-ids lake:0,lake:2 --make-solid
 ```
 
-If lake lowering is enabled and no standing-water shapefile is found in `./geometry_data`, the merge will stop with an error so the result is not silently wrong.
+The GUI generates `lake:N` and `river:N` IDs after **Detect touched**. If the SwissTopo `NAME` field is available, the water selector shows it; otherwise it falls back to type, center, and approximate size.
+
+The old `--lake-lower-mm 1.2` flag still works as an alias for lake-and-river lower mode. If water handling is enabled and required standing-water or river shapefiles are missing in `./geometry_data`, the merge stops with an error so the result is not silently wrong.
 
 ### Border clipping
 
@@ -251,6 +287,9 @@ project/
     swisstlm3d.../
       TLM_GEWAESSER/
         swissTLM3D_TLM_STEHENDES_GEWAESSER.shp
+        swissTLM3D_TLM_FLIESSGEWAESSER.shp
+      TLM_BRIDGES/
+        swissTLM3D_TLM_BRIDGE_PROTECTION.shp
   images/
     selection.png
     download_csv.png
@@ -268,7 +307,10 @@ python build_stl.py --all --target-size-mm 150
 python build_stl.py --all --target-size-mm 150 --input-resolution
 python build_stl.py --all --target-size-mm 150 --crop-rect 2600000 1200000 2600500 1200400
 python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001 --make-solid
-python build_stl.py --merge-stl output/terrain.stl --lake-lower-mm 1.2
+python build_stl.py --merge-stl output/terrain.stl --water-mode lower --water-lower-mm 1.2
+python build_stl.py --merge-stl output/terrain.stl --water-mode remove --river-width-mm 0.8 --make-solid
+python build_stl.py --merge-stl output/terrain.stl --water-mode remove --water-features lakes --make-solid
+python build_stl.py --merge-stl output/terrain.stl --clean-tiles-after-merge
 python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp geometry_data/swissboundaries.../LANDESGRENZE.shp --border-scale auto
 python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp geometry_data/swissboundaries.../KANTONSGRENZE.shp --border-keep "Bern,Uri"
 ```
@@ -287,10 +329,11 @@ python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp ge
 **STL too large**
 - Use a coarser preset such as **Draft**, or increase the manual downsample step.
 
-**Lake lowering does nothing**
-- Confirm the lake lowering value is greater than `0`.
-- Confirm the standing-water shapefile exists under `geometry_data`.
-- Confirm the lakes actually intersect the merged model bounds.
+**Water handling does nothing**
+- Confirm **Water treatment** is set to **lower** or **remove**.
+- For lower mode, confirm the lower value is greater than `0`.
+- Confirm the standing-water and flowing-water shapefiles exist under `geometry_data`.
+- Confirm the water features actually intersect the merged model bounds.
 
 ---
 
