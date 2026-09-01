@@ -29,8 +29,10 @@ Global solid (important for printing):
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import re
 import shutil
 import struct
 import sys
@@ -44,7 +46,9 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 
-GEOMETRY_DATA_DIRNAME = "geometry_data"
+GEOMETRY_DATA_DIRNAME = "reference_data"
+AUTO_BUILDINGS_DIR = Path("work") / "buildings" / "auto"
+DEFAULT_RIVERBANK_GEOJSON = Path("work") / "water" / "riverbanks.geojson"
 
 
 @dataclass(frozen=True)
@@ -1126,15 +1130,14 @@ def _convert_worker(
 
 
 def _list_input_files() -> List[Path]:
-    xyz_folder = Path("./data/xyz")
-    tif_folder = Path("./data/tif")
+    xyz_folder = Path("./work/terrain/xyz")
+    tif_folder = Path("./work/terrain/tif")
     xyz_files = sorted(xyz_folder.rglob("*.xyz")) if xyz_folder.exists() else []
     tif_files = []
     if tif_folder.exists():
         tif_files = sorted(tif_folder.rglob("*.tif")) + sorted(tif_folder.rglob("*.tiff"))
-    root_tifs = sorted(Path("./data").glob("*.tif")) + sorted(Path("./data").glob("*.tiff"))
     input_files = []
-    for path in tif_files + root_tifs:
+    for path in tif_files:
         if path not in input_files:
             input_files.append(path)
 
@@ -1147,7 +1150,7 @@ def _list_input_files() -> List[Path]:
     input_files = xyz_files + input_files
     if not input_files:
         raise SystemExit(
-            "No .xyz or .tif files found in ./data/xyz, ./data/tif, or ./data."
+            "No .xyz or .tif files found in ./work/terrain/xyz or ./work/terrain/tif."
         )
     return input_files
 
@@ -1451,6 +1454,19 @@ def _parse_border_scale(raw: str, tiles_dir: Path) -> float:
         ratio = _parse_scale_ratio(value)
         return 1000.0 / float(ratio)
     return float(value)
+
+
+def _read_last_z_scale(path: Path) -> float:
+    if not path.exists():
+        return 1.0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 1.0
+    try:
+        return float(data.get("z_scale", 1.0))
+    except (TypeError, ValueError):
+        return 1.0
 
 
 def _parse_border_keep_list(raw: str) -> List[str]:
@@ -2132,13 +2148,54 @@ def _source_bounds_for_model_bounds(model_bounds: Tuple[float, float, float, flo
     )
 
 
+def _load_riverbank_polygons_for_lines(
+    geojson_path: Path,
+    river_lines: List[object],
+    *,
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+) -> List[object]:
+    try:
+        from shapely.geometry import shape as shapely_shape
+        from shapely.ops import unary_union
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("River outlines require 'shapely'.") from exc
+
+    try:
+        payload = json.loads(geojson_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Could not read riverbank GeoJSON {geojson_path}: {exc}") from exc
+
+    selected_lines = unary_union(river_lines)
+    polygons: List[object] = []
+    for feature in payload.get("features", []):
+        geometry_data = feature.get("geometry") if isinstance(feature, dict) else None
+        if not geometry_data:
+            continue
+        geom = shapely_shape(geometry_data)
+        if geom.is_empty or geom.geom_type not in {"Polygon", "MultiPolygon"}:
+            continue
+        bounds = geom.bounds
+        if not _bounds_intersect(bounds[0], bounds[1], bounds[2], bounds[3], min_x, min_y, max_x, max_y):
+            continue
+        if not geom.intersects(selected_lines):
+            continue
+        if geom.geom_type == "Polygon":
+            polygons.append(geom)
+        else:
+            polygons.extend(part for part in geom.geoms if not part.is_empty)
+    return polygons
+
+
 def _prepare_water_geometries(
     *,
     lake_shp: Optional[Path],
     river_shp: Optional[Path],
+    riverbank_geojson: Optional[Path],
     bridge_shps: List[Path],
     water_scale: float,
-    river_width_mm: float,
     bridge_buffer_mm: float,
     model_bounds: Tuple[float, float, float, float],
     water_feature_ids: Optional[set[str]] = None,
@@ -2172,15 +2229,29 @@ def _prepare_water_geometries(
             max_y=src_max_y,
             keep_ids=water_feature_ids,
         )
-        line_buffer = max(float(river_width_mm), 0.0) / 2.0
-        if line_buffer <= 0.0:
-            raise ValueError("River width must be > 0 when river detection is enabled.")
-        for line in river_lines:
-            geom_scaled = _scale_border_geometry(line, water_scale) if water_scale != 1.0 else line
-            water_geoms.append(geom_scaled.buffer(line_buffer, cap_style=2, join_style=2))
+        if riverbank_geojson is None or not riverbank_geojson.exists():
+            raise FileNotFoundError(
+                "Actual river outlines are required but no riverbank GeoJSON was found. "
+                "Run download_riverbanks.py with the SwissALTI CSV first."
+            )
+        river_polygons = _load_riverbank_polygons_for_lines(
+            riverbank_geojson,
+            river_lines,
+            min_x=src_min_x,
+            min_y=src_min_y,
+            max_x=src_max_x,
+            max_y=src_max_y,
+        )
+        if not river_polygons:
+            raise RuntimeError(
+                "No actual riverbank polygons matched the selected river centerlines. "
+                "Leave rivers unchecked or choose an area with mapped OSM river outlines."
+            )
+        for geom in river_polygons:
+            water_geoms.append(_scale_border_geometry(geom, water_scale) if water_scale != 1.0 else geom)
         print(
-            f"[WATER] Loaded {len(river_lines):,} river line feature(s) for model bounds "
-            f"with {float(river_width_mm):.3f} mm width"
+            f"[WATER] Loaded {len(river_polygons):,} actual riverbank polygon(s) "
+            f"intersecting {len(river_lines):,} selected river centerline feature(s)"
         )
 
     if river_shp is not None and bridge_shps:
@@ -2202,6 +2273,299 @@ def _prepare_water_geometries(
             )
 
     return water_geoms, bridge_geoms
+
+
+def _default_building_paths() -> List[Path]:
+    paths: List[Path] = []
+    for root in _geometry_search_roots():
+        if not root.exists():
+            continue
+        for suffix in ("*.gml", "*.xml"):
+            paths.extend(p for p in root.rglob(suffix) if p.is_file())
+    return sorted(paths)
+
+
+def _building_input_paths(raw_paths: Optional[List[Path]]) -> List[Path]:
+    if not raw_paths:
+        return _default_building_paths()
+    out: List[Path] = []
+    for path in raw_paths:
+        if path.is_dir():
+            for suffix in ("*.gml", "*.xml"):
+                out.extend(p for p in path.rglob(suffix) if p.is_file())
+        elif path.is_file():
+            out.append(path)
+    return sorted(set(out))
+
+
+def _parse_gml_poslist(text: str, dimension: int) -> List[Tuple[float, float, float]]:
+    values = [float(part) for part in text.split()]
+    if dimension < 2:
+        dimension = 3
+    coords = []
+    for idx in range(0, len(values) - dimension + 1, dimension):
+        x = values[idx]
+        y = values[idx + 1]
+        z = values[idx + 2] if dimension >= 3 else 0.0
+        coords.append((float(x), float(y), float(z)))
+    return coords
+
+
+def _polygon_coords_from_gml(poly) -> List[Tuple[float, float, float]]:
+    pos_lists = []
+    for elem in poly.iter():
+        if elem.tag.endswith("posList") and elem.text and elem.text.strip():
+            pos_lists.append(elem)
+    if pos_lists:
+        elem = pos_lists[0]
+        try:
+            dimension = int(elem.attrib.get("srsDimension", "3"))
+        except ValueError:
+            dimension = 3
+        coords = _parse_gml_poslist(elem.text or "", dimension)
+    else:
+        coords = []
+        for elem in poly.iter():
+            if elem.tag.endswith("pos") and elem.text and elem.text.strip():
+                parsed = _parse_gml_poslist(elem.text, 3)
+                if parsed:
+                    coords.append(parsed[0])
+    if len(coords) >= 2 and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    return coords
+
+
+def _coords_intersect_bounds(coords: List[Tuple[float, float, float]], bounds: Tuple[float, float, float, float]) -> bool:
+    if not coords:
+        return False
+    xs = [pt[0] for pt in coords]
+    ys = [pt[1] for pt in coords]
+    return _bounds_intersect(min(xs), min(ys), max(xs), max(ys), *bounds)
+
+
+def _clip_polygon_to_xy_bounds(
+    coords: np.ndarray,
+    bounds: Tuple[float, float, float, float],
+) -> np.ndarray:
+    """Clip a 3D polygon to an XY rectangle while interpolating boundary heights."""
+    min_x, min_y, max_x, max_y = bounds
+
+    def clip_edge(vertices: np.ndarray, axis: int, limit: float, keep_greater: bool) -> np.ndarray:
+        if vertices.shape[0] == 0:
+            return vertices
+        result: List[np.ndarray] = []
+        previous = vertices[-1]
+        previous_inside = previous[axis] >= limit if keep_greater else previous[axis] <= limit
+        for current in vertices:
+            current_inside = current[axis] >= limit if keep_greater else current[axis] <= limit
+            if current_inside != previous_inside:
+                delta = current[axis] - previous[axis]
+                if delta != 0.0:
+                    ratio = (limit - previous[axis]) / delta
+                    result.append(previous + ratio * (current - previous))
+            if current_inside:
+                result.append(current)
+            previous = current
+            previous_inside = current_inside
+        return np.asarray(result, dtype=np.float64)
+
+    clipped = np.asarray(coords, dtype=np.float64)
+    for axis, limit, keep_greater in (
+        (0, min_x, True),
+        (0, max_x, False),
+        (1, min_y, True),
+        (1, max_y, False),
+    ):
+        clipped = clip_edge(clipped, axis, limit, keep_greater)
+        if clipped.shape[0] < 3:
+            return np.empty((0, 3), dtype=np.float64)
+
+    # Avoid zero-area fan triangles when a boundary vertex is repeated.
+    unique_vertices = [clipped[0]]
+    for vertex in clipped[1:]:
+        if not np.allclose(vertex, unique_vertices[-1], rtol=0.0, atol=1e-9):
+            unique_vertices.append(vertex)
+    clipped = np.asarray(unique_vertices, dtype=np.float64)
+    if clipped.shape[0] > 1 and np.allclose(clipped[0], clipped[-1], rtol=0.0, atol=1e-9):
+        clipped = clipped[:-1]
+    return clipped if clipped.shape[0] >= 3 else np.empty((0, 3), dtype=np.float64)
+
+
+def _iter_citygml_polygon_poslists(path: Path):
+    """Yield exterior CityGML polygon coordinate text without constructing XML nodes."""
+    closing_tag = b"</gml:Polygon>"
+    poslist_re = re.compile(
+        rb"<gml:posList(?P<attrs>[^>]*)>(?P<coords>.*?)</gml:posList>",
+        re.DOTALL,
+    )
+    dimension_re = re.compile(rb"srsDimension=[\"'](?P<dimension>\d+)[\"']")
+    buffer = b""
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(8 * 1024 * 1024)
+            if not chunk and not buffer:
+                return
+            buffer += chunk
+            cursor = 0
+            while True:
+                end = buffer.find(closing_tag, cursor)
+                if end < 0:
+                    break
+                block_end = end + len(closing_tag)
+                block = buffer[cursor:block_end]
+                cursor = block_end
+                start = block.rfind(b"<gml:Polygon")
+                if start < 0:
+                    continue
+                match = poslist_re.search(block, start)
+                if match is None:
+                    continue
+                dimension_match = dimension_re.search(match.group("attrs"))
+                dimension = int(dimension_match.group("dimension")) if dimension_match else 3
+                bytes_scanned = source.tell() - len(buffer) + cursor
+                yield match.group("coords"), dimension, bytes_scanned
+            buffer = buffer[cursor:]
+            if not chunk:
+                return
+
+
+def _building_cache_path(
+    paths: List[Path],
+    source_bounds: Tuple[float, float, float, float],
+    xy_scale: float,
+    z_scale: float,
+    max_files: int,
+) -> Path:
+    digest = hashlib.sha256()
+    digest.update(b"building-rectangle-clip-v1")
+    digest.update(repr(tuple(round(value, 4) for value in source_bounds)).encode("ascii"))
+    digest.update(repr((round(xy_scale, 10), round(z_scale, 10), max_files)).encode("ascii"))
+    for path in paths[:max_files] if max_files > 0 else paths:
+        stat = path.stat()
+        digest.update(str(path.resolve()).encode("utf-8"))
+        digest.update(repr((stat.st_size, stat.st_mtime_ns)).encode("ascii"))
+    return Path("output") / "cache" / "buildings" / f"{digest.hexdigest()[:20]}.npz"
+
+
+def _load_building_mesh_cache(path: Path) -> Optional[Mesh]:
+    if not path.exists():
+        return None
+    try:
+        with np.load(path, allow_pickle=False) as cached:
+            vertices = np.asarray(cached["vertices"], dtype=np.float64)
+            faces = np.asarray(cached["faces"], dtype=np.int64)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"[BUILDINGS] Ignoring invalid cached mesh {path.name}: {exc}")
+        return None
+    if vertices.ndim != 2 or vertices.shape[1] != 3 or faces.ndim != 2 or faces.shape[1] != 3:
+        return None
+    print(f"[BUILDINGS] Reusing clipped building cache: {path.name}")
+    return Mesh(vertices=vertices, faces=faces)
+
+
+def _save_building_mesh_cache(path: Path, mesh: Mesh) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        vertices=np.asarray(mesh.vertices, dtype=np.float32),
+        faces=np.asarray(mesh.faces, dtype=np.int32),
+    )
+    for stale_path in path.parent.glob("*.npz"):
+        if stale_path != path:
+            try:
+                stale_path.unlink()
+            except OSError:
+                pass
+    print(f"[BUILDINGS] Saved clipped building cache: {path}")
+
+
+def _citygml_buildings_to_mesh(
+    paths: List[Path],
+    *,
+    source_bounds: Tuple[float, float, float, float],
+    xy_scale: float,
+    z_scale: float,
+    max_files: int = 0,
+) -> Optional[Mesh]:
+    if not paths:
+        return None
+
+    vertex_blocks: List[np.ndarray] = []
+    face_blocks: List[np.ndarray] = []
+    vertex_count = 0
+    files_used = 0
+    polygons_used = 0
+    polygons_clipped = 0
+    selected_paths = paths[:max_files] if max_files > 0 else paths
+    total_files = len(selected_paths)
+    for path in selected_paths:
+        print(f"[BUILDINGS_PROGRESS] {files_used}/{total_files} {path.name}")
+        files_used += 1
+        try:
+            polygons_seen = 0
+            file_size = max(1, path.stat().st_size)
+            for raw_coords, dimension, bytes_scanned in _iter_citygml_polygon_poslists(path):
+                polygons_seen += 1
+                if polygons_seen % 50000 == 0:
+                    fraction = min(1.0, bytes_scanned / file_size)
+                    print(
+                        f"[BUILDINGS_FILE_PROGRESS] {files_used}/{total_files} {fraction:.6f} "
+                        f"{path.name} {polygons_seen:,} surfaces scanned, {polygons_used:,} kept"
+                    )
+                values = np.fromstring(raw_coords, dtype=np.float64, sep=" ")
+                if dimension < 2 or values.size < dimension * 3 or values.size % dimension:
+                    continue
+                coords = values.reshape((-1, dimension))
+                if dimension == 2:
+                    coords = np.column_stack((coords, np.zeros(coords.shape[0], dtype=np.float64)))
+                else:
+                    coords = coords[:, :3]
+                if coords.shape[0] > 1 and np.array_equal(coords[0], coords[-1]):
+                    coords = coords[:-1]
+                if coords.shape[0] < 3:
+                    continue
+                if not _bounds_intersect(
+                    float(coords[:, 0].min()), float(coords[:, 1].min()),
+                    float(coords[:, 0].max()), float(coords[:, 1].max()), *source_bounds,
+                ):
+                    continue
+                was_clipped = bool(
+                    np.any(coords[:, 0] < source_bounds[0])
+                    or np.any(coords[:, 0] > source_bounds[2])
+                    or np.any(coords[:, 1] < source_bounds[1])
+                    or np.any(coords[:, 1] > source_bounds[3])
+                )
+                coords = _clip_polygon_to_xy_bounds(coords, source_bounds)
+                if coords.shape[0] < 3:
+                    continue
+                if was_clipped:
+                    polygons_clipped += 1
+                scaled = coords * np.asarray((xy_scale, xy_scale, z_scale), dtype=np.float64)
+                indices = np.arange(1, scaled.shape[0] - 1, dtype=np.int64)
+                face_blocks.append(
+                    np.column_stack((
+                        np.full(indices.shape[0], vertex_count, dtype=np.int64),
+                        vertex_count + indices,
+                        vertex_count + indices + 1,
+                    ))
+                )
+                vertex_blocks.append(scaled)
+                vertex_count += scaled.shape[0]
+                polygons_used += 1
+        except OSError as exc:
+            print(f"[BUILDINGS] Skipping unreadable CityGML {path}: {exc}")
+        print(f"[BUILDINGS_PROGRESS] {files_used}/{total_files} {path.name}")
+
+    if not face_blocks:
+        print(f"[BUILDINGS] No CityGML building polygons intersected the model bounds across {files_used:,} file(s).")
+        return None
+    mesh = Mesh(vertices=np.vstack(vertex_blocks), faces=np.vstack(face_blocks))
+    print(
+        f"[BUILDINGS] Loaded {polygons_used:,} CityGML polygon surface(s) "
+        f"from {files_used:,}/{len(paths):,} file(s): {mesh.faces.shape[0]:,} triangles; "
+        f"clipped {polygons_clipped:,} polygon(s) to model bounds"
+    )
+    return mesh
 
 
 def _combined_xy_mask(geoms: List[object], xs: np.ndarray, ys: np.ndarray) -> np.ndarray:
@@ -2529,11 +2893,15 @@ def merge_stls_mesh(
     water_lower_mm: float = 0.0,
     lake_shp: Optional[Path] = None,
     river_shp: Optional[Path] = None,
+    riverbank_geojson: Optional[Path] = None,
     bridge_shps: Optional[List[Path]] = None,
     water_scale: float = 1.0,
-    river_width_mm: float = 0.8,
     bridge_buffer_mm: float = 1.2,
     water_feature_ids: Optional[set[str]] = None,
+    building_paths: Optional[List[Path]] = None,
+    buildings_xy_scale: float = 1.0,
+    buildings_z_scale: float = 1.0,
+    buildings_max_files: int = 0,
     clean_tiles_after_merge: bool = False,
     clip_border: bool = False,
     border_geom=None,
@@ -2647,9 +3015,9 @@ def merge_stls_mesh(
         water_geoms, bridge_geoms = _prepare_water_geometries(
             lake_shp=lake_shp,
             river_shp=river_shp,
+            riverbank_geojson=riverbank_geojson,
             bridge_shps=list(bridge_shps or []),
             water_scale=float(water_scale),
-            river_width_mm=float(river_width_mm),
             bridge_buffer_mm=float(bridge_buffer_mm),
             model_bounds=model_bounds,
             water_feature_ids=water_feature_ids,
@@ -2665,6 +3033,13 @@ def merge_stls_mesh(
             amount_mm=float(water_lower_mm),
         )
 
+    model_bounds_for_overlays = (
+        float(merged.vertices[:, 0].min()),
+        float(merged.vertices[:, 1].min()),
+        float(merged.vertices[:, 0].max()),
+        float(merged.vertices[:, 1].max()),
+    )
+
     if make_solid_flag:
         if base_z_value is not None:
             base_z = float(base_z_value)
@@ -2673,6 +3048,36 @@ def merge_stls_mesh(
         else:
             base_z = float(merged.vertices[:, 2].min() - float(base_thickness_value))
         merged = make_solid(merged, base_z)
+
+    if building_paths:
+        source_bounds = _source_bounds_for_model_bounds(model_bounds_for_overlays, float(buildings_xy_scale))
+        cache_path = _building_cache_path(
+            building_paths,
+            source_bounds,
+            float(buildings_xy_scale),
+            float(buildings_z_scale),
+            int(buildings_max_files),
+        )
+        building_mesh = _load_building_mesh_cache(cache_path)
+        if building_mesh is None:
+            print("[BUILDINGS] Building clipped mesh cache; this is only needed once for this model area.")
+            building_mesh = _citygml_buildings_to_mesh(
+                building_paths,
+                source_bounds=source_bounds,
+                xy_scale=float(buildings_xy_scale),
+                z_scale=float(buildings_z_scale),
+                max_files=int(buildings_max_files),
+            )
+            if building_mesh is not None:
+                _save_building_mesh_cache(cache_path, building_mesh)
+        if building_mesh is not None:
+            merged = concat_meshes([merged, building_mesh])
+            if float(weld_tol) > 0.0:
+                merged = weld_vertices(merged, float(weld_tol))
+            print(
+                f"[BUILDINGS] Appended buildings. Final mesh: "
+                f"{merged.vertices.shape[0]:,} vertices, {merged.faces.shape[0]:,} triangles"
+            )
 
     if binary_out:
         write_binary_stl(merged, out_stl, solid_name=solid_name)
@@ -2694,7 +3099,7 @@ def main() -> None:
     ap.add_argument(
         "--all",
         action="store_true",
-        help="Convert all .xyz (./data/xyz) and .tif/.tiff (./data/tif) into ./output/tiles.",
+        help="Convert all .xyz and .tif/.tiff files in ./work/terrain into ./output/tiles.",
     )
     ap.add_argument(
         "--merge-stl",
@@ -2711,7 +3116,7 @@ def main() -> None:
         "--border-shp",
         type=Path,
         default=None,
-        help="Path to a Swiss border .shp file (default: auto-detect from ./geometry_data).",
+        help="Path to a Swiss border .shp file (default: auto-detect from ./reference_data).",
     )
     ap.add_argument(
         "--border-scale",
@@ -2756,7 +3161,7 @@ def main() -> None:
         "--lake-shp",
         type=Path,
         default=None,
-        help="Path to a lake polygon .shp file used during merge (default: auto-detect standing water in ./geometry_data).",
+        help="Path to a lake polygon .shp file used during merge (default: auto-detect standing water in ./reference_data).",
     )
     ap.add_argument(
         "--water-mode",
@@ -2787,13 +3192,13 @@ def main() -> None:
         "--river-shp",
         type=Path,
         default=None,
-        help="Path to a river centerline .shp file (default: auto-detect TLM_FLIESSGEWAESSER in ./geometry_data).",
+        help="Path to a river centerline .shp file (default: auto-detect TLM_FLIESSGEWAESSER in ./reference_data).",
     )
     ap.add_argument(
-        "--river-width-mm",
-        type=float,
-        default=0.8,
-        help="Final-model width used to buffer river centerlines for lowering/removal (default: 0.8 mm).",
+        "--riverbank-geojson",
+        type=Path,
+        default=DEFAULT_RIVERBANK_GEOJSON,
+        help="LV95 GeoJSON with actual OSM riverbank polygons (default: ./work/water/riverbanks.geojson).",
     )
     ap.add_argument(
         "--bridge-shp",
@@ -2808,6 +3213,24 @@ def main() -> None:
         type=float,
         default=1.2,
         help="Final-model width used to protect bridge features from water lowering/removal (default: 1.2 mm).",
+    )
+    ap.add_argument(
+        "--buildings",
+        action="store_true",
+        help="Append swissBUILDINGS3D 3.0 Beta CityGML building surfaces during --merge-stl.",
+    )
+    ap.add_argument(
+        "--buildings-path",
+        type=Path,
+        action="append",
+        default=[],
+        help="CityGML file or directory for swissBUILDINGS3D 3.0 Beta. May be passed more than once; default: auto-detect .gml/.xml under reference_data.",
+    )
+    ap.add_argument(
+        "--buildings-max-files",
+        type=int,
+        default=0,
+        help="Optional limit on CityGML files to read, useful for testing. Default 0 means no limit.",
     )
     ap.add_argument(
         "--merge-z-scale",
@@ -2966,10 +3389,12 @@ def main() -> None:
         ap.error("--water-mode requires at least one --water-features value: lakes or rivers.")
     if args.water_mode == "lower" and float(args.water_lower_mm) <= 0.0:
         ap.error("--water-mode lower requires --water-lower-mm > 0.")
-    if args.water_mode != "off" and float(args.river_width_mm) <= 0.0:
-        ap.error("--river-width-mm must be > 0.")
     if args.water_mode != "off" and float(args.bridge_buffer_mm) < 0.0:
         ap.error("--bridge-buffer-mm must be >= 0.")
+    if args.buildings and args.merge_stl is None:
+        ap.error("--buildings can only be used with --merge-stl.")
+    if args.buildings_max_files < 0:
+        ap.error("--buildings-max-files must be >= 0.")
 
     try:
         crop_rect = _parse_crop_rect(args.crop_rect)
@@ -2983,12 +3408,16 @@ def main() -> None:
         border_geom = None
         lake_shp = None
         river_shp = None
+        riverbank_geojson = None
         bridge_shps: List[Path] = []
         water_scale = 1.0
+        building_paths: List[Path] = []
+        buildings_xy_scale = 1.0
+        buildings_z_scale = 1.0
         if args.clip_border:
             border_path = args.border_shp or _default_border_shp()
             if border_path is None:
-                ap.error("--clip-border requested but no border shapefile was found in ./geometry_data.")
+                ap.error("--clip-border requested but no border shapefile was found in ./reference_data.")
             border_scale = _parse_border_scale(str(args.border_scale), Path("./output/tiles"))
             print(f"[BORDER] Loading border from {border_path}")
             keep_values = _parse_border_keep_list(str(args.border_keep))
@@ -3008,11 +3437,12 @@ def main() -> None:
             if include_lakes:
                 lake_shp = args.lake_shp or _default_lake_shp()
             if include_lakes and lake_shp is None:
-                ap.error("--water-mode requested but no standing-water shapefile was found in ./geometry_data.")
+                ap.error("--water-mode requested but no standing-water shapefile was found in ./reference_data.")
             if include_rivers:
                 river_shp = args.river_shp or _default_river_shp()
+                riverbank_geojson = args.riverbank_geojson
             if include_rivers and river_shp is None:
-                ap.error("--water-mode requested but no river shapefile was found in ./geometry_data.")
+                ap.error("--water-mode requested but no river shapefile was found in ./reference_data.")
             bridge_shps = list(args.bridge_shp or []) or _default_bridge_shps()
             water_scale = _parse_border_scale("auto", Path("./output/tiles"))
             if lake_shp is not None:
@@ -3021,6 +3451,7 @@ def main() -> None:
                 print("[WATER] Lake features disabled")
             if river_shp is not None:
                 print(f"[WATER] Using river centerlines from {river_shp}")
+                print(f"[WATER] Using actual river outlines from {riverbank_geojson}")
             else:
                 print("[WATER] River features disabled")
             if bridge_shps:
@@ -3028,6 +3459,19 @@ def main() -> None:
             else:
                 print("[WATER] No bridge shapefiles found; river/lake treatment will not preserve bridges.")
             print(f"[WATER] Using XY scale {water_scale:.6f} for merged water matching")
+
+        if args.buildings:
+            building_paths = _building_input_paths(list(args.buildings_path or []))
+            if not building_paths:
+                ap.error("--buildings requested but no .gml or .xml building files were found.")
+            buildings_xy_scale = _parse_border_scale("auto", Path("./output/tiles"))
+            tile_z_scale = _read_last_z_scale(Path("./output/tiles") / "scale_info.json")
+            buildings_z_scale = buildings_xy_scale * tile_z_scale * float(args.merge_z_scale)
+            print(f"[BUILDINGS] Using {len(building_paths):,} CityGML building file(s)")
+            print(
+                f"[BUILDINGS] XY scale {buildings_xy_scale:.6f}; "
+                f"Z scale {buildings_z_scale:.6f}"
+            )
 
         # Load + weld for seamless joins; solidify once globally if requested.
         merge_name = args.model_name.strip() or "terrain_merged"
@@ -3045,11 +3489,15 @@ def main() -> None:
             water_lower_mm=float(args.water_lower_mm),
             lake_shp=lake_shp,
             river_shp=river_shp,
+            riverbank_geojson=riverbank_geojson,
             bridge_shps=bridge_shps,
             water_scale=float(water_scale),
-            river_width_mm=float(args.river_width_mm),
             bridge_buffer_mm=float(args.bridge_buffer_mm),
             water_feature_ids=water_feature_ids,
+            building_paths=building_paths,
+            buildings_xy_scale=float(buildings_xy_scale),
+            buildings_z_scale=float(buildings_z_scale),
+            buildings_max_files=int(args.buildings_max_files),
             clean_tiles_after_merge=bool(args.clean_tiles_after_merge),
             clip_border=bool(args.clip_border),
             border_geom=border_geom,
@@ -3066,7 +3514,7 @@ def main() -> None:
         tif_count = len([p for p in input_files if p.suffix.lower() in {".tif", ".tiff"}])
         print(
             f"Found {len(input_files)} input file(s) "
-            f"({xyz_count} XYZ, {tif_count} TIF) under ./data/xyz, ./data/tif, or ./data"
+            f"({xyz_count} XYZ, {tif_count} TIF) under ./work/terrain"
         )
         if crop_rect is not None:
             print(

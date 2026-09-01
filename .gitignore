@@ -1,5 +1,9 @@
-# Ignore all input data
-data/
+# User-provided and generated geodata
+input/
+work/
+reference_data/
+# Legacy local reference-data location; never publish downloaded shapefiles.
+geometry_data/
 
 # Ignore all generated STL files
 *.stl

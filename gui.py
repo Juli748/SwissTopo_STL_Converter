@@ -12,7 +12,7 @@ from tkinter import filedialog, messagebox, ttk
 from defaults import DEFAULTS
 
 
-GEOMETRY_DATA_DIRNAME = "geometry_data"
+GEOMETRY_DATA_DIRNAME = "reference_data"
 
 
 class Tooltip:
@@ -76,8 +76,9 @@ class App(tk.Tk):
         self.geometry(f"{target_w}x{target_h}")
         self.minsize(target_w, target_h)
 
-        self.data_dir = Path(__file__).resolve().parent / "data"
-        self.xyz_dir = self.data_dir / "xyz"
+        self.input_dir = Path(__file__).resolve().parent / "input"
+        self.terrain_dir = Path(__file__).resolve().parent / "work" / "terrain"
+        self.xyz_dir = self.terrain_dir / "xyz"
         self.output_dir = Path(__file__).resolve().parent / "output"
         self.tiles_dir = self.output_dir / "tiles"
         self.geometry_data_dir = Path(__file__).resolve().parent / GEOMETRY_DATA_DIRNAME
@@ -88,10 +89,12 @@ class App(tk.Tk):
         self.status_vars: dict[str, tk.StringVar] = {}
         self.status_labels: dict[str, ttk.Label] = {}
         self.current_status_key: str | None = None
+        self.current_command_label = ""
         self.model_name_var = tk.StringVar(value=DEFAULTS["model_name"])
         self._auto_merge_out = ""
         self.download_progress_var = tk.DoubleVar(value=0.0)
         self.download_progress_label_var = tk.StringVar(value="")
+        self.download_matching_buildings_var = tk.BooleanVar(value=DEFAULTS["download_matching_buildings"])
         self.convert_progress_var = tk.DoubleVar(value=0.0)
         self.convert_progress_label_var = tk.StringVar(value="")
         self.merge_progress_var = tk.DoubleVar(value=0.0)
@@ -240,6 +243,9 @@ class App(tk.Tk):
         buttons = ttk.Frame(main)
         buttons.pack(fill=tk.X, pady=8)
         ttk.Button(buttons, text="Clear Log", command=self._clear_log).pack(side=tk.LEFT)
+        ttk.Button(buttons, text="Open Input CSV", command=lambda: self._open_folder(self.input_dir, "input CSV")).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="Open Work Data", command=lambda: self._open_folder(self.terrain_dir.parent, "work data")).pack(side=tk.LEFT, padx=(8, 0))
+        ttk.Button(buttons, text="Open Reference Data", command=lambda: self._open_folder(self.geometry_data_dir, "reference data")).pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(buttons, text="Open Output Folder", command=self._open_output_folder).pack(side=tk.RIGHT)
 
     def _on_mousewheel(self, event: tk.Event) -> None:
@@ -290,18 +296,24 @@ class App(tk.Tk):
         entry.grid(row=0, column=1, sticky=tk.EW, padx=6)
         browse_btn = ttk.Button(frame, text="Browse", command=self._browse_csv)
         browse_btn.grid(row=0, column=2, padx=4, pady=2)
-        copy_btn = ttk.Button(frame, text="Copy to data/", command=self._copy_csv)
+        copy_btn = ttk.Button(frame, text="Copy to input/", command=self._copy_csv)
         copy_btn.grid(row=0, column=3, padx=4, pady=2)
 
         download_note = ttk.Label(
             frame,
-            text="Download into data/xyz and data/tif using download_tiles.py",
+            text="Download terrain into work/terrain using download_tiles.py",
         )
         workers_label = ttk.Label(frame, text="Max parallel downloads:")
         workers_label.grid(row=1, column=0, sticky=tk.W, pady=2)
         self.download_workers_var = tk.StringVar(value=DEFAULTS["download_workers"])
         workers_entry = ttk.Entry(frame, textvariable=self.download_workers_var, width=8)
         workers_entry.grid(row=1, column=1, sticky=tk.W)
+        buildings_download_check = ttk.Checkbutton(
+            frame,
+            text="Download matching buildings",
+            variable=self.download_matching_buildings_var,
+        )
+        buildings_download_check.grid(row=1, column=2, columnspan=2, sticky=tk.W, padx=(4, 0))
 
         download_note.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=2)
         self.download_btn = ttk.Button(frame, text="Run Download", command=self._run_download)
@@ -345,7 +357,7 @@ class App(tk.Tk):
             ),
             Tooltip(
                 copy_btn,
-                "Copies the CSV into ./data so it is picked up automatically next time.",
+                "Copies the CSV into ./input, which contains CSV files only.",
             ),
             Tooltip(
                 workers_label,
@@ -356,12 +368,16 @@ class App(tk.Tk):
                 "Try 4-8 for faster downloads. Set to 1 for sequential.",
             ),
             Tooltip(
+                buildings_download_check,
+                "After the SwissALTI download, query SwissTopo for swissBUILDINGS3D CityGML covering the same CSV tile area and use it during merge.",
+            ),
+            Tooltip(
                 self.download_btn,
-                "Runs download_tiles.py to fetch tiles into ./data/xyz and ./data/tif.",
+                "Runs download_tiles.py to fetch terrain tiles. If matching buildings is checked, downloads swissBUILDINGS3D for the same SwissALTI CSV area too.",
             ),
             Tooltip(
                 download_note,
-                "Tiles are stored under ./data/xyz as .xyz files and ./data/tif as GeoTIFF.",
+                "Downloaded terrain is stored under ./work/terrain/xyz and ./work/terrain/tif.",
             ),
         ]
 
@@ -729,8 +745,10 @@ class App(tk.Tk):
         self.water_include_lakes_var = tk.BooleanVar(value=DEFAULTS["water_include_lakes"])
         self.water_include_rivers_var = tk.BooleanVar(value=DEFAULTS["water_include_rivers"])
         self.water_lower_mm_var = tk.StringVar(value=DEFAULTS["water_lower_mm"])
-        self.river_width_mm_var = tk.StringVar(value=DEFAULTS["river_width_mm"])
         self.bridge_buffer_mm_var = tk.StringVar(value=DEFAULTS["bridge_buffer_mm"])
+        self.buildings_enabled_var = tk.BooleanVar(value=DEFAULTS["buildings_enabled"])
+        self.buildings_path_var = tk.StringVar(value=DEFAULTS["buildings_path"])
+        self.buildings_max_files_var = tk.StringVar(value=DEFAULTS["buildings_max_files"])
         self.clean_tiles_after_merge_var = tk.BooleanVar(value=DEFAULTS["clean_tiles_after_merge"])
         self.make_solid_var = tk.BooleanVar(value=DEFAULTS["make_solid"])
         self.base_mode_var = tk.StringVar(value=DEFAULTS["base_mode"])
@@ -826,20 +844,15 @@ class App(tk.Tk):
         self.water_lower_entry = ttk.Entry(surface_frame, textvariable=self.water_lower_mm_var, width=10)
         self.water_lower_entry.grid(row=2, column=1, sticky=tk.W, padx=(8, 0))
 
-        self.river_width_label = ttk.Label(surface_frame, text="River width (mm):")
-        self.river_width_label.grid(row=3, column=0, sticky=tk.W, pady=4)
-        self.river_width_entry = ttk.Entry(surface_frame, textvariable=self.river_width_mm_var, width=10)
-        self.river_width_entry.grid(row=3, column=1, sticky=tk.W, padx=(8, 0))
-
         self.bridge_buffer_label = ttk.Label(surface_frame, text="Bridge protect (mm):")
-        self.bridge_buffer_label.grid(row=4, column=0, sticky=tk.W, pady=4)
+        self.bridge_buffer_label.grid(row=3, column=0, sticky=tk.W, pady=4)
         self.bridge_buffer_entry = ttk.Entry(surface_frame, textvariable=self.bridge_buffer_mm_var, width=10)
-        self.bridge_buffer_entry.grid(row=4, column=1, sticky=tk.W, padx=(8, 0))
+        self.bridge_buffer_entry.grid(row=3, column=1, sticky=tk.W, padx=(8, 0))
 
         self.water_pick_label = ttk.Label(surface_frame, text="Specific water:")
-        self.water_pick_label.grid(row=5, column=0, sticky=tk.NW, pady=4)
+        self.water_pick_label.grid(row=4, column=0, sticky=tk.NW, pady=4)
         water_feature_frame = ttk.Frame(surface_frame)
-        water_feature_frame.grid(row=5, column=1, columnspan=2, sticky=tk.EW, padx=(8, 12))
+        water_feature_frame.grid(row=4, column=1, columnspan=2, sticky=tk.EW, padx=(8, 12))
         self.water_feature_list = tk.Listbox(
             water_feature_frame,
             selectmode=tk.MULTIPLE,
@@ -937,8 +950,29 @@ class App(tk.Tk):
         clip_frame.columnconfigure(2, weight=1)
         clip_frame.columnconfigure(4, weight=1)
 
+        buildings_frame = ttk.LabelFrame(frame, text="Optional Buildings")
+        buildings_frame.grid(row=4, column=0, sticky=tk.EW, pady=(0, 6))
+        self.buildings_check = ttk.Checkbutton(
+            buildings_frame,
+            text="Add swissBUILDINGS3D CityGML",
+            variable=self.buildings_enabled_var,
+            command=self._update_merge_controls,
+        )
+        self.buildings_check.grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.buildings_path_label = ttk.Label(buildings_frame, text="CityGML folder/file:")
+        self.buildings_path_label.grid(row=1, column=0, sticky=tk.W, pady=2)
+        self.buildings_path_entry = ttk.Entry(buildings_frame, textvariable=self.buildings_path_var)
+        self.buildings_path_entry.grid(row=1, column=1, sticky=tk.EW, padx=(8, 8))
+        self.buildings_path_btn = ttk.Button(buildings_frame, text="Browse", command=self._browse_buildings_path)
+        self.buildings_path_btn.grid(row=1, column=2, pady=2)
+        self.buildings_max_label = ttk.Label(buildings_frame, text="Max files:")
+        self.buildings_max_label.grid(row=1, column=3, sticky=tk.W, padx=(12, 0))
+        self.buildings_max_entry = ttk.Entry(buildings_frame, textvariable=self.buildings_max_files_var, width=8)
+        self.buildings_max_entry.grid(row=1, column=4, sticky=tk.W, padx=(8, 0))
+        buildings_frame.columnconfigure(1, weight=1)
+
         merge_summary = ttk.Label(frame, textvariable=self.merge_summary_var)
-        merge_summary.grid(row=4, column=0, sticky=tk.W, pady=(0, 4))
+        merge_summary.grid(row=5, column=0, sticky=tk.W, pady=(0, 4))
 
         advanced_toggle = ttk.Checkbutton(
             frame,
@@ -946,10 +980,10 @@ class App(tk.Tk):
             variable=self.show_merge_advanced_var,
             command=self._update_merge_controls,
         )
-        advanced_toggle.grid(row=5, column=0, sticky=tk.W, pady=(4, 4))
+        advanced_toggle.grid(row=6, column=0, sticky=tk.W, pady=(4, 4))
 
         self.merge_advanced_frame = ttk.Frame(frame)
-        self.merge_advanced_frame.grid(row=6, column=0, sticky=tk.EW)
+        self.merge_advanced_frame.grid(row=7, column=0, sticky=tk.EW)
 
         weld_label = ttk.Label(self.merge_advanced_frame, text="Weld tolerance:")
         weld_label.grid(row=0, column=0, sticky=tk.W, pady=4)
@@ -962,7 +996,7 @@ class App(tk.Tk):
         merge_z_entry.grid(row=0, column=3, sticky=tk.W)
 
         action_row = ttk.Frame(frame)
-        action_row.grid(row=7, column=0, sticky=tk.EW, pady=(6, 0))
+        action_row.grid(row=8, column=0, sticky=tk.EW, pady=(6, 0))
         self.status_vars["merge"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["merge"] = ttk.Label(action_row, textvariable=self.status_vars["merge"])
         self.status_labels["merge"].grid(row=0, column=0, sticky=tk.W)
@@ -1036,12 +1070,24 @@ class App(tk.Tk):
                 "Used in lower mode. Moves detected lake and river vertices down by this amount.",
             ),
             Tooltip(
-                self.river_width_entry,
-                "Final-model width used to buffer river centerlines.",
-            ),
-            Tooltip(
                 self.bridge_buffer_entry,
                 "Final-model width protected around road and rail bridge features.",
+            ),
+            Tooltip(
+                self.buildings_check,
+                "Append swissBUILDINGS3D 3.0 Beta CityGML building geometry to the final STL.",
+            ),
+            Tooltip(
+                self.buildings_path_entry,
+                "Folder or file containing swissBUILDINGS3D CityGML. The automatic work/buildings/auto source is refreshed for the selected SwissALTI CSV before merging.",
+            ),
+            Tooltip(
+                self.buildings_path_btn,
+                "Choose a folder containing swissBUILDINGS3D CityGML files.",
+            ),
+            Tooltip(
+                self.buildings_max_entry,
+                "Optional test limit for how many CityGML files to read. Leave empty for all.",
             ),
             Tooltip(
                 border_mode_label,
@@ -1053,7 +1099,7 @@ class App(tk.Tk):
             ),
             Tooltip(
                 border_clip_radio,
-                "Clip the final mesh to a selected boundary. Requires border shapefiles in geometry_data.",
+                "Clip the final mesh to a selected boundary. Requires border shapefiles in reference_data.",
             ),
             Tooltip(
                 self.border_shp_combo,
@@ -1498,7 +1544,7 @@ class App(tk.Tk):
             if self.water_include_lakes_var.get():
                 lake_path = build_stl._default_lake_shp()
                 if lake_path is None:
-                    raise RuntimeError("No standing-water shapefile was found in geometry_data.")
+                    raise RuntimeError("No standing-water shapefile was found in reference_data.")
                 lake_features = build_stl._load_lake_features_for_bounds(
                     lake_path,
                     min_x=src_bounds[0],
@@ -1515,7 +1561,7 @@ class App(tk.Tk):
             if self.water_include_rivers_var.get():
                 river_path = build_stl._default_river_shp()
                 if river_path is None:
-                    raise RuntimeError("No river shapefile was found in geometry_data.")
+                    raise RuntimeError("No river shapefile was found in reference_data.")
                 river_features = build_stl._load_water_line_features_for_bounds(
                     river_path,
                     min_x=src_bounds[0],
@@ -1585,15 +1631,14 @@ class App(tk.Tk):
             self._refresh_ui_state()
 
     def _load_default_csv(self) -> None:
-        csv_files = sorted(self.data_dir.glob("*.csv"))
+        csv_files = sorted(self.input_dir.glob("*.csv"))
         if csv_files and not self.csv_path_var.get().strip():
             self.csv_path_var.set(str(csv_files[0]))
 
     def _count_input_files(self) -> tuple[int, int]:
-        tif_dir = self.data_dir / "tif"
+        tif_dir = self.terrain_dir / "tif"
         xyz_count = len(list(self.xyz_dir.glob("*.xyz")))
         tif_count = len(list(tif_dir.glob("*.tif"))) + len(list(tif_dir.glob("*.tiff")))
-        tif_count += len(list(self.data_dir.glob("*.tif"))) + len(list(self.data_dir.glob("*.tiff")))
         return xyz_count, tif_count
 
     def _count_tiles(self) -> int:
@@ -1640,6 +1685,8 @@ class App(tk.Tk):
             selected_ids = self._selected_water_feature_ids()
             if selected_ids is not None:
                 parts.append(f"{len(selected_ids)} selected water feature(s)")
+        if self.buildings_enabled_var.get():
+            parts.append("buildings enabled")
         return "Merge setup: " + ", ".join(parts) + "."
 
     def _selected_water_feature_label(self) -> str:
@@ -1717,10 +1764,20 @@ class App(tk.Tk):
             if download_args is None:
                 return
             commands.append((download_args, "Download tiles", "download"))
+            building_download_args = self._build_matching_buildings_download_args()
+            if building_download_args is None:
+                return
+            if building_download_args:
+                commands.append((building_download_args, "Download buildings", "download"))
+            riverbank_download_args = self._build_riverbank_download_args()
+            if riverbank_download_args is None:
+                return
+            if riverbank_download_args:
+                commands.append((riverbank_download_args, "Download river outlines", "download"))
         elif not (xyz_count or tif_count):
             messagebox.showwarning(
                 "Missing input",
-                "Select a CSV to download tiles, or place XYZ/TIF tiles into data/ before running the full pipeline.",
+                "Select a CSV to download tiles, or place XYZ/TIF tiles into work/terrain before running the full pipeline.",
             )
             return
 
@@ -1743,8 +1800,8 @@ class App(tk.Tk):
         if not src_path.exists():
             messagebox.showerror("Missing CSV", f"File not found: {src_path}")
             return
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        dest = self.data_dir / src_path.name
+        self.input_dir.mkdir(parents=True, exist_ok=True)
+        dest = self.input_dir / src_path.name
         if dest.exists():
             if not messagebox.askyesno("Overwrite CSV", f"{dest} exists. Overwrite?"):
                 return
@@ -1765,6 +1822,12 @@ class App(tk.Tk):
             self._auto_merge_out = path
             self._refresh_ui_state()
 
+    def _browse_buildings_path(self) -> None:
+        path = filedialog.askdirectory(title="Select swissBUILDINGS3D CityGML folder")
+        if path:
+            self.buildings_path_var.set(path)
+            self._refresh_ui_state()
+
     def _build_download_args(self) -> list[str] | None:
         args = [sys.executable, "download_tiles.py"]
         csv_path = self.csv_path_var.get().strip()
@@ -1774,17 +1837,80 @@ class App(tk.Tk):
         if workers:
             args += ["--workers", workers]
 
-        tif_dir = self.data_dir / "tif"
+        tif_dir = self.terrain_dir / "tif"
         existing_xyz = [p for p in self.xyz_dir.iterdir() if p.is_file()] if self.xyz_dir.exists() else []
         existing_tif = [p for p in tif_dir.iterdir() if p.is_file()] if tif_dir.exists() else []
         if existing_xyz or existing_tif:
             if messagebox.askyesno(
                 "Replace existing files?",
-                "Existing XYZ or TIF files found in data/xyz or data/tif. Delete them before downloading?",
+                "Existing XYZ or TIF files found in work/terrain. Delete them before downloading?",
             ):
                 args.append("--clean-xyz")
 
         return args
+
+    def _build_matching_buildings_download_args(self) -> list[str] | None:
+        auto_dir = Path(DEFAULTS["buildings_auto_dir"])
+        configured_path = self.buildings_path_var.get().strip()
+        try:
+            uses_auto_dir = bool(configured_path) and Path(configured_path).resolve() == auto_dir.resolve()
+        except OSError:
+            uses_auto_dir = configured_path == str(auto_dir)
+
+        # An empty source means the user selected buildings without supplying a
+        # manual CityGML folder, so use the automatic source for the active CSV.
+        # Once selected, keep that source in sync to avoid stale coverage data.
+        use_automatic_source = not configured_path or uses_auto_dir
+        if not self.download_matching_buildings_var.get() and not (
+            self.buildings_enabled_var.get() and use_automatic_source
+        ):
+            return []
+        csv_path = self.csv_path_var.get().strip()
+        if not csv_path:
+            messagebox.showwarning(
+                "Missing SwissALTI CSV",
+                "Select a SwissALTI CSV before downloading matching buildings.",
+            )
+            return None
+        self.buildings_enabled_var.set(True)
+        self.buildings_path_var.set(str(auto_dir))
+        self._update_merge_controls()
+        args = [
+            sys.executable,
+            "download_buildings.py",
+            "--csv",
+            csv_path,
+            "--output-dir",
+            str(auto_dir),
+            "--sync",
+        ]
+        workers = self.download_workers_var.get().strip()
+        if workers:
+            args += ["--workers", workers]
+        return args
+
+    def _build_riverbank_download_args(self) -> list[str] | None:
+        water_mode = self.water_mode_var.get().strip()
+        if water_mode == "off" or not self.water_include_rivers_var.get():
+            return []
+        output_path = Path(DEFAULTS["riverbank_geojson"])
+        csv_path = self.csv_path_var.get().strip()
+        if not csv_path:
+            if output_path.exists():
+                return []
+            messagebox.showwarning(
+                "Missing SwissALTI CSV",
+                "Select the SwissALTI CSV so actual river outlines can be downloaded before merge.",
+            )
+            return None
+        return [
+            sys.executable,
+            "download_riverbanks.py",
+            "--csv",
+            csv_path,
+            "--output",
+            str(output_path),
+        ]
 
     def _build_convert_args(self) -> list[str] | None:
         args = [sys.executable, "build_stl.py", "--all"]
@@ -1930,9 +2056,6 @@ class App(tk.Tk):
             selected_water_ids = self._selected_water_feature_ids()
             if selected_water_ids:
                 args += ["--water-feature-ids", ",".join(selected_water_ids)]
-            river_width = self.river_width_mm_var.get().strip()
-            if river_width:
-                args += ["--river-width-mm", river_width]
             bridge_buffer = self.bridge_buffer_mm_var.get().strip()
             if bridge_buffer:
                 args += ["--bridge-buffer-mm", bridge_buffer]
@@ -1940,6 +2063,15 @@ class App(tk.Tk):
                 water_lower = self.water_lower_mm_var.get().strip()
                 if water_lower:
                     args += ["--water-lower-mm", water_lower]
+
+        if self.buildings_enabled_var.get():
+            args.append("--buildings")
+            buildings_path = self.buildings_path_var.get().strip()
+            if buildings_path:
+                args += ["--buildings-path", buildings_path]
+            max_files = self.buildings_max_files_var.get().strip()
+            if max_files:
+                args += ["--buildings-max-files", max_files]
 
         if self.make_solid_var.get():
             args.append("--make-solid")
@@ -1952,7 +2084,7 @@ class App(tk.Tk):
 
         if self.merge_border_mode_var.get() == "clip":
             if not self.border_options:
-                messagebox.showerror("Missing borders", "No border shapefiles found in ./geometry_data.")
+                messagebox.showerror("Missing borders", "No border shapefiles found in ./reference_data.")
                 return None
             args.append("--clip-border")
             border_label = self.border_shp_var.get().strip()
@@ -1980,7 +2112,18 @@ class App(tk.Tk):
         args = self._build_download_args()
         if args is None:
             return
-        self._run_command(args, "Download tiles", status_key="download")
+        building_download_args = self._build_matching_buildings_download_args()
+        if building_download_args is None:
+            return
+        if building_download_args:
+            self._queue_pipeline_commands(
+                [
+                    (args, "Download tiles", "download"),
+                    (building_download_args, "Download buildings", "download"),
+                ]
+            )
+        else:
+            self._run_command(args, "Download tiles", status_key="download")
 
     def _run_convert(self) -> None:
         self.convert_progress_var.set(0.0)
@@ -1993,10 +2136,26 @@ class App(tk.Tk):
     def _run_merge(self) -> None:
         self.merge_progress_var.set(0.0)
         self.merge_progress_label_var.set("")
+        building_download_args = self._build_matching_buildings_download_args()
+        if building_download_args is None:
+            return
+        riverbank_download_args = self._build_riverbank_download_args()
+        if riverbank_download_args is None:
+            return
         args = self._build_merge_args()
         if args is None:
             return
-        self._run_command(args, "Merge tiles", status_key="merge")
+
+        commands: list[tuple[list[str], str, str]] = []
+        if building_download_args:
+            commands.append((building_download_args, "Download buildings", "download"))
+        if riverbank_download_args:
+            commands.append((riverbank_download_args, "Download river outlines", "download"))
+        if commands:
+            commands.append((args, "Merge tiles", "merge"))
+            self._queue_pipeline_commands(commands)
+        else:
+            self._run_command(args, "Merge tiles", status_key="merge")
 
     def _on_model_name_change(self, _event: tk.Event) -> None:
         name = self.model_name_var.get().strip()
@@ -2016,6 +2175,15 @@ class App(tk.Tk):
             args.insert(1, "-u")
         self._set_status(status_key, "Running...", "#38bdf8")
         self.current_status_key = status_key
+        self.current_command_label = label
+        if status_key == "download":
+            stage = {
+                "Download buildings": "Buildings",
+                "Download river outlines": "River outlines",
+            }.get(label, "Terrain")
+            self.download_progress_var.set(0.0)
+            self.download_progress_label_var.set(f"{stage}: preparing...")
+            self._set_status(status_key, f"{stage}...", "#38bdf8")
 
         self._log(f"[RUN] {label}")
         self._log(f"Command: {' '.join(args)}")
@@ -2042,6 +2210,7 @@ class App(tk.Tk):
             finally:
                 self.current_process = None
                 self.current_status_key = None
+                self.current_command_label = ""
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2056,6 +2225,33 @@ class App(tk.Tk):
         self.after(100, self._poll_log)
 
     def _handle_progress_line(self, line: str) -> None:
+        if line.startswith("[BUILDINGS_FILE_PROGRESS]"):
+            try:
+                payload = line[len("[BUILDINGS_FILE_PROGRESS]"):].strip()
+                counter, fraction_str, detail = payload.split(" ", 2)
+                current_str, total_str = counter.split("/", 1)
+                current = int(current_str)
+                total = int(total_str)
+                fraction = min(1.0, max(0.0, float(fraction_str)))
+            except ValueError:
+                return
+            if self.current_status_key == "merge" and total > 0:
+                self.merge_progress_var.set(((current - 1 + fraction) / total) * 100.0)
+                self.merge_progress_label_var.set(f"Buildings: {detail}")
+            return
+        if line.startswith("[BUILDINGS_PROGRESS]"):
+            try:
+                payload = line[len("[BUILDINGS_PROGRESS]"):].strip()
+                counter, name = payload.split(" ", 1)
+                current_str, total_str = counter.split("/", 1)
+                current = int(current_str)
+                total = int(total_str)
+            except ValueError:
+                return
+            if total > 0:
+                self.merge_progress_var.set((current / total) * 100.0)
+                self.merge_progress_label_var.set(f"Buildings: {current} of {total} ({name})")
+            return
         if not line.startswith("[PROGRESS]"):
             return
         try:
@@ -2071,7 +2267,11 @@ class App(tk.Tk):
         pct = (current / total) * 100.0
         if self.current_status_key == "download":
             self.download_progress_var.set(pct)
-            self.download_progress_label_var.set(f"Downloaded {current} of {total} ({name})")
+            stage = {
+                "Download buildings": "Buildings",
+                "Download river outlines": "River outlines",
+            }.get(self.current_command_label, "Terrain")
+            self.download_progress_label_var.set(f"{stage}: {current} of {total} ({name})")
         elif self.current_status_key == "convert":
             self.convert_progress_var.set(pct)
             self.convert_progress_label_var.set(f"Converted {current} of {total} ({name})")
@@ -2087,18 +2287,21 @@ class App(tk.Tk):
         self.log_text.delete("1.0", tk.END)
 
     def _open_output_folder(self) -> None:
-        if not self.output_dir.exists():
+        self._open_folder(self.output_dir, "output")
+
+    def _open_folder(self, folder: Path, description: str) -> None:
+        if not folder.exists():
             messagebox.showinfo(
-                "No output yet",
-                "The output folder will be created when tiles or a final STL are written.",
+                f"No {description} yet",
+                f"The {description} folder will be created when it is needed.",
             )
             return
         if sys.platform.startswith("win"):
-            subprocess.Popen(["explorer", str(self.output_dir.resolve())])
+            subprocess.Popen(["explorer", str(folder.resolve())])
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(self.output_dir.resolve())])
+            subprocess.Popen(["open", str(folder.resolve())])
         else:
-            subprocess.Popen(["xdg-open", str(self.output_dir.resolve())])
+            subprocess.Popen(["xdg-open", str(folder.resolve())])
 
     def _update_convert_mode(self) -> None:
         advanced_active = self.show_convert_advanced_var.get()
@@ -2188,19 +2391,24 @@ class App(tk.Tk):
         self.water_lower_entry.configure(state="normal" if lower_enabled else "disabled")
         self.water_lakes_check.configure(state="normal" if water_enabled else "disabled")
         self.water_rivers_check.configure(state="normal" if water_enabled else "disabled")
-        self.river_width_entry.configure(state="normal" if rivers_enabled else "disabled")
         self.bridge_buffer_entry.configure(state="normal" if rivers_enabled else "disabled")
         self.water_feature_list.configure(state="normal" if water_enabled else "disabled")
         self.water_feature_refresh_btn.configure(state="normal" if water_enabled else "disabled")
         self.water_features_label.configure(foreground="#e2e8f0" if water_enabled else "#6b7280")
         self.water_lower_label.configure(foreground="#e2e8f0" if lower_enabled else "#6b7280")
-        self.river_width_label.configure(foreground="#e2e8f0" if rivers_enabled else "#6b7280")
         self.bridge_buffer_label.configure(foreground="#e2e8f0" if rivers_enabled else "#6b7280")
         self.water_pick_label.configure(foreground="#e2e8f0" if water_enabled else "#6b7280")
         if not water_enabled:
             self.water_feature_options = []
             self.water_feature_ids_by_label = {}
             self.water_feature_list.delete(0, tk.END)
+
+        buildings_enabled = self.buildings_enabled_var.get()
+        self.buildings_path_entry.configure(state="normal" if buildings_enabled else "disabled")
+        self.buildings_path_btn.configure(state="normal" if buildings_enabled else "disabled")
+        self.buildings_max_entry.configure(state="normal" if buildings_enabled else "disabled")
+        self.buildings_path_label.configure(foreground="#e2e8f0" if buildings_enabled else "#6b7280")
+        self.buildings_max_label.configure(foreground="#e2e8f0" if buildings_enabled else "#6b7280")
 
         if self.show_merge_advanced_var.get():
             self.merge_advanced_frame.grid()

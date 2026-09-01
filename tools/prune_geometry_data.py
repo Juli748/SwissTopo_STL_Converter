@@ -14,9 +14,7 @@ from shapely.ops import polygonize, unary_union
 
 
 ROOT = Path(__file__).resolve().parents[1]
-GEOMETRY = ROOT / "geometry_data"
-TLM_ROOT = GEOMETRY / "swisstlm3d_2026-02_2056_5728.shp"
-BRIDGE_DIR = TLM_ROOT / "TLM_BRIDGES"
+GEOMETRY = ROOT / "reference_data"
 BRIDGE_BASE = "swissTLM3D_TLM_BRIDGE_PROTECTION"
 LAKE_SOURCE_BASE = "swissTLM3D_TLM_STEHENDES_GEWAESSER"
 LAKE_POLYGON_BASE = "swissTLM3D_TLM_LAKE_POLYGONS"
@@ -35,9 +33,16 @@ KEEP_SUFFIXES = {
     BRIDGE_BASE: {".shp", ".shx", ".dbf", ".prj", ".cpg"},
 }
 TRANSPORT_SOURCES = [
-    TLM_ROOT / "TLM_STRASSEN" / "swissTLM3D_TLM_STRASSE.shp",
-    TLM_ROOT / "TLM_OEV" / "swissTLM3D_TLM_EISENBAHN.shp",
+    ("TLM_STRASSEN", "swissTLM3D_TLM_STRASSE.shp"),
+    ("TLM_OEV", "swissTLM3D_TLM_EISENBAHN.shp"),
 ]
+
+
+def _tlm_root() -> Path:
+    roots = sorted(path for path in GEOMETRY.glob("swisstlm3d_*_2056_5728.shp") if path.is_dir())
+    if not roots:
+        raise FileNotFoundError("No extracted SwissTLM3D shapefile package was found in reference_data.")
+    return roots[-1]
 
 
 def _normalize(value: object) -> str:
@@ -111,8 +116,9 @@ def _polygon_parts(poly: Polygon) -> list[list[tuple[float, float]]]:
 
 
 def _write_lake_polygons() -> Path:
-    source = TLM_ROOT / "TLM_GEWAESSER" / f"{LAKE_SOURCE_BASE}.shp"
-    out_base = TLM_ROOT / "TLM_GEWAESSER" / LAKE_POLYGON_BASE
+    tlm_root = _tlm_root()
+    source = tlm_root / "TLM_GEWAESSER" / f"{LAKE_SOURCE_BASE}.shp"
+    out_base = tlm_root / "TLM_GEWAESSER" / LAKE_POLYGON_BASE
     out_shp = out_base.with_suffix(".shp")
     if out_shp.exists():
         print(f"Keeping existing lake polygon shapefile: {out_shp}")
@@ -179,8 +185,10 @@ def _write_lake_polygons() -> Path:
 
 
 def _write_bridge_protection() -> Path:
-    source_paths = [path for path in TRANSPORT_SOURCES if path.exists()]
-    out_base = BRIDGE_DIR / BRIDGE_BASE
+    tlm_root = _tlm_root()
+    source_paths = [tlm_root / folder / filename for folder, filename in TRANSPORT_SOURCES]
+    source_paths = [path for path in source_paths if path.exists()]
+    out_base = tlm_root / "TLM_BRIDGES" / BRIDGE_BASE
     existing_out = out_base.with_suffix(".shp")
     if existing_out.exists():
         print(f"Keeping existing bridge protection shapefile: {existing_out}")
@@ -188,7 +196,7 @@ def _write_bridge_protection() -> Path:
     if not source_paths:
         raise FileNotFoundError("No transport source shapefiles found for bridge protection export.")
 
-    BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
+    out_base.parent.mkdir(parents=True, exist_ok=True)
     for suffix in (".shp", ".shx", ".dbf", ".prj", ".cpg"):
         path = out_base.with_suffix(suffix)
         if path.exists():
@@ -231,19 +239,17 @@ def _write_bridge_protection() -> Path:
 def _prune_geometry() -> None:
     _assert_inside(GEOMETRY, ROOT)
 
-    duplicate = GEOMETRY / "swisstlm3d_2026-02-24_2056_5728.shp"
-    if duplicate.exists():
-        _remove_tree(duplicate, GEOMETRY)
-
-    if not TLM_ROOT.exists():
+    try:
+        tlm_root = _tlm_root()
+    except FileNotFoundError:
         return
 
-    for child in TLM_ROOT.iterdir():
+    for child in tlm_root.iterdir():
         if child.is_dir() and child.name not in KEEP_DIRS:
-            _remove_tree(child, TLM_ROOT)
+            _remove_tree(child, tlm_root)
 
     for keep_dir in KEEP_DIRS:
-        path = TLM_ROOT / keep_dir
+        path = tlm_root / keep_dir
         if not path.exists():
             continue
         for file_path in path.iterdir():
@@ -260,7 +266,7 @@ def main() -> None:
     _prune_geometry()
     total = sum(path.stat().st_size for path in GEOMETRY.rglob("*") if path.is_file())
     count = sum(1 for path in GEOMETRY.rglob("*") if path.is_file())
-    print(f"geometry_data now contains {count:,} file(s), {total / (1024 ** 2):.1f} MiB")
+    print(f"reference_data now contains {count:,} file(s), {total / (1024 ** 2):.1f} MiB")
 
 
 if __name__ == "__main__":

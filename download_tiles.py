@@ -63,10 +63,10 @@ def _iter_csv_paths(repo_root: Path, csv_path: str | None) -> list[Path]:
             return []
         return [selected]
 
-    data_dir = repo_root / "data"
-    csv_files = sorted(data_dir.glob("*.csv"))
+    input_dir = repo_root / "input"
+    csv_files = sorted(input_dir.glob("*.csv"))
     if not csv_files:
-        print(f"No CSV files found in: {data_dir}")
+        print(f"No CSV files found in: {input_dir}")
         return []
     return csv_files
 
@@ -86,10 +86,10 @@ def _maybe_clear_inputs(xyz_dir: Path, tif_dir: Path, clean_xyz: bool) -> None:
         return
 
     if not sys.stdin.isatty():
-        print("Existing XYZ/TIF files found in ./data. Keeping them (non-interactive).")
+        print("Existing terrain files found in ./work/terrain. Keeping them (non-interactive).")
         return
 
-    response = input("Existing files found in ./data/xyz or ./data/tif. Delete them? [y/N]: ").strip().lower()
+    response = input("Existing files found in ./work/terrain/xyz or ./work/terrain/tif. Delete them? [y/N]: ").strip().lower()
     if response in {"y", "yes"}:
         for file_path in existing_xyz_files + existing_tif_files:
             try:
@@ -135,12 +135,12 @@ def main():
         "--csv",
         dest="csv_path",
         default=None,
-        help="CSV file with download URLs (if omitted, uses all CSV files in ./data).",
+        help="CSV file with download URLs (if omitted, uses all CSV files in ./input).",
     )
     parser.add_argument(
         "--clean-xyz",
         action="store_true",
-        help="Delete existing files in ./data/xyz and ./data/tif before downloading.",
+        help="Delete existing files in ./work/terrain/xyz and ./work/terrain/tif before downloading.",
     )
     parser.add_argument(
         "--workers",
@@ -151,21 +151,21 @@ def main():
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent
-    data_dir = repo_root / "data"
+    terrain_dir = repo_root / "work" / "terrain"
     csv_files = _iter_csv_paths(repo_root, args.csv_path)
     if not csv_files:
         return 1
 
-    data_dir.mkdir(parents=True, exist_ok=True)
-    extract_dir = data_dir / "_extract_temp"
+    terrain_dir.mkdir(parents=True, exist_ok=True)
+    extract_dir = terrain_dir / "_extract_temp"
     extract_dir.mkdir(parents=True, exist_ok=True)
-    zips_temp_dir = data_dir / "_zips_temp"
+    zips_temp_dir = terrain_dir / "_zips_temp"
     zips_temp_dir.mkdir(parents=True, exist_ok=True)
     clear_directory(extract_dir)
     clear_directory(zips_temp_dir)
-    xyz_dir = data_dir / "xyz"
+    xyz_dir = terrain_dir / "xyz"
     xyz_dir.mkdir(parents=True, exist_ok=True)
-    tif_dir = data_dir / "tif"
+    tif_dir = terrain_dir / "tif"
     tif_dir.mkdir(parents=True, exist_ok=True)
     _maybe_clear_inputs(xyz_dir, tif_dir, args.clean_xyz)
 
@@ -243,6 +243,8 @@ def main():
             copied += 1
     if copied:
         print(f"Copied {copied} XYZ files to {xyz_dir}")
+
+    shutil.rmtree(extract_dir, ignore_errors=True)
 
     print("Done.")
     return 0

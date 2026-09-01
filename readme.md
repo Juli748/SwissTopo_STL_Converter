@@ -2,11 +2,28 @@
 
 ## Get the SwissTopo CSV (first step)
 
-Download the CSV of swissALTI3D tiles from SwissTopo and place it into `data/` (recommended). The GUI can also browse to the CSV anywhere on disk and optionally copy it into `data/`.
+Download the CSV of swissALTI3D tiles from SwissTopo and place it into `input/`. This folder is reserved for CSV files only. The GUI can also browse to a CSV anywhere on disk and copy it into `input/`.
+
+The project keeps terrain inputs, reference layers, and generated results separate:
+
+- `input/`: SwissALTI CSV files only
+- `work/`: downloaded terrain tiles and automatic building data; do not place files here manually
+- `reference_data/`: automatically downloaded SwissTopo reference layers for borders, lakes, rivers, and bridge protection
+- `output/`: generated STL files; `output/tiles/` contains temporary per-tile STLs
+
+The bottom of the GUI has buttons to open each location directly.
+
+Before using border clipping, water treatment, or bridge protection, download the reference layers once:
+
+```bash
+python download_reference_data.py
+```
+
+The script queries SwissTopo for the current shapefile packages, extracts only the required layers, creates compact lake and bridge layers, and removes its temporary download. `reference_data/` is intentionally excluded from Git.
 
 1. Open the swissALTI3D page and select the tiles you want.
 2. Export or download the CSV from the selection.
-3. Save the CSV into `data/` so the GUI picks it up automatically, or browse to it directly from the app.
+3. Save the CSV into `input/` so the GUI picks it up automatically, or browse to it directly from the app.
 
 ![SwissTopo selection](images/selection.png)
 ![Download CSV](images/download_csv.png)
@@ -97,7 +114,7 @@ py -3 -m pip install numpy scipy rasterio fiona shapely pyshp
 
 The current GUI is organized around a simple default path:
 
-1. Select a SwissTopo CSV or use files already in `data/`
+1. Place a SwissTopo CSV in `input/` or select it with **Browse**
 2. Choose the final model size and a detail preset
 3. Use the step buttons in order: **Run Download**, **Create STL Tiles**, then **Build Final STL**
 
@@ -124,11 +141,12 @@ This reveals controls such as manual step size, explicit scale source, grid tole
 
 ## Step 1: Download XYZ/TIF tiles
 
-This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `data/xyz`. It also supports GeoTIFF or COG URLs that download directly into `data/tif`.
+This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `work/terrain/xyz`. It also supports GeoTIFF or COG URLs that download directly into `work/terrain/tif`.
 
 **How to use it**
 - Click **Browse** and select your CSV with download URLs.
-- Optionally click **Copy to data/** to keep a copy inside the project.
+- Optionally click **Copy to input/** to keep the CSV inside the project.
+- Optional: enable **Download matching buildings** when the CSV is for swissALTI. The app derives the LV95 tile rectangle from the SwissALTI URLs and downloads swissBUILDINGS3D CityGML for the same area.
 - Click **Run Download**.
 - If existing terrain tiles are found, the GUI can prompt to clean them first.
 
@@ -137,6 +155,7 @@ This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `da
 - If the file has multiple columns, only the first column is used.
 - Comment lines starting with `#` are ignored.
 - Supports ZIPs containing XYZ and direct GeoTIFF/COG URLs.
+- Matching building download expects SwissALTI-style URL names containing LV95 tile coordinates, for example `2683-1247`.
 
 **Typical SwissTopo sources**
 - swissALTI3D (DTM)
@@ -146,7 +165,7 @@ This step downloads ZIP tiles from a CSV of URLs and extracts XYZ files into `da
 
 ## Step 2: Convert XYZ/TIF to STL tiles
 
-This step converts every `.xyz` file in `data/xyz` and every `.tif/.tiff` file in `data/tif` into one STL tile per file in `output/tiles`.
+This step converts every `.xyz` file in `work/terrain/xyz` and every `.tif/.tiff` file in `work/terrain/tif` into one STL tile per file in `output/tiles`.
 
 ### Default conversion flow
 
@@ -186,6 +205,7 @@ This step merges all tiles in `output/tiles` into a single STL and can also prep
 - **Base Z (optional)**: explicit base elevation that overrides thickness
 - **Surface adjustments**: lower or remove selected lake and river surfaces in the merged model
 - **Optional border / region clip**: merge all tiles, or clip to a selected border, canton, or bezirk
+- **Optional buildings**: append swissBUILDINGS3D 3.0 Beta CityGML building geometry for detailed city prints
 
 ### Advanced merge options
 
@@ -206,7 +226,8 @@ Water handling works during the final merge stage.
 - **Specific water** works like the border region selector. Click **Detect touched** to list lakes/rivers that intersect the current tiles, leave **(all touched water)** selected for every touched feature, or select individual lake/river rows to affect only those.
 - Lakes come from `TLM_STEHENDES_GEWAESSER`
 - The pruning helper also builds `TLM_LAKE_POLYGONS`, and the app prefers it for lake removal so large lakes are removed as full polygons instead of shoreline fragments
-- Rivers come from `TLM_FLIESSGEWAESSER`, are grouped by SwissTopo watercourse ID, and are buffered with **River width (mm)** in final model units
+- Rivers are identified and selected from `TLM_FLIESSGEWAESSER` by SwissTopo watercourse ID. Before merge, the GUI automatically downloads actual OpenStreetMap riverbank polygons for the same CSV area into `work/water/riverbanks.geojson`; these polygons, not a guessed line buffer, determine the river width and shape.
+- If OpenStreetMap has no bank polygon for a selected narrow stream, the merge stops rather than inventing a width. Leave that river unchecked to continue with lakes and mapped rivers.
 - River/lake rows show the official SwissTopo `NAME` when present. If SwissTopo does not provide a name for that feature, the GUI shows a fallback such as `Unnamed river 102102`.
 - Bridges are protected from river lowering/removal using road and railway features whose `KUNSTBAUTE` value is a bridge
 
@@ -218,7 +239,7 @@ The current official SwissTopo source is swissTLM3D from the SwissTopo OGD downl
 https://ogd.swisstopo.admin.ch/ch.swisstopo.swisstlm3d?lang=en
 ```
 
-Download the current `swisstlm3d_..._2056_5728.shp.zip` package and extract these layers under `./geometry_data`:
+Download the current `swisstlm3d_..._2056_5728.shp.zip` package and extract these layers under `./reference_data`:
 
 ```text
 TLM_GEWAESSER/swissTLM3D_TLM_STEHENDES_GEWAESSER.*
@@ -237,19 +258,43 @@ For the CLI, the same feature is exposed with:
 
 ```bash
 python build_stl.py --merge-stl output/terrain.stl --water-mode lower --water-lower-mm 1.2
-python build_stl.py --merge-stl output/terrain.stl --water-mode remove --river-width-mm 0.8
-python build_stl.py --merge-stl output/terrain.stl --water-mode remove --water-features lakes,rivers --river-width-mm 0.8
+python download_riverbanks.py --csv input/your_urls.csv
+python build_stl.py --merge-stl output/terrain.stl --water-mode remove
+python build_stl.py --merge-stl output/terrain.stl --water-mode remove --water-features lakes,rivers
 python build_stl.py --merge-stl output/terrain.stl --water-mode remove --water-features lakes --make-solid
 python build_stl.py --merge-stl output/terrain.stl --water-mode remove --water-features lakes --water-feature-ids lake:0,lake:2 --make-solid
 ```
 
 The GUI generates `lake:N` and `river:N` IDs after **Detect touched**. If the SwissTopo `NAME` field is available, the water selector shows it; otherwise it falls back to type, center, and approximate size.
 
-The old `--lake-lower-mm 1.2` flag still works as an alias for lake-and-river lower mode. If water handling is enabled and required standing-water or river shapefiles are missing in `./geometry_data`, the merge stops with an error so the result is not silently wrong.
+The old `--lake-lower-mm 1.2` flag still works as an alias for lake-and-river lower mode. If water handling is enabled and required standing-water or river shapefiles are missing in `./reference_data`, the merge stops with an error so the result is not silently wrong.
+
+### swissBUILDINGS3D CityGML Buildings
+
+The final merge can append swissBUILDINGS3D 3.0 Beta CityGML building surfaces to the terrain STL.
+
+- Use the **Optional Buildings** section in the GUI
+- Enable **Add swissBUILDINGS3D CityGML**
+- Choose a CityGML `.gml` file or a folder containing extracted `.gml` / `.xml` files
+- Or, select **Add swissBUILDINGS3D CityGML** and leave its CityGML path empty. With a SwissALTI CSV selected, the GUI downloads matching CityGML into `work/buildings/auto` and selects it automatically for merge. The **Download matching buildings** option in Step 1 does the same ahead of time. Any merge using the automatic source refreshes it for the current CSV. Repeated runs reuse already extracted files, retain only the latest available edition of each coverage package, and remove stale auto-downloaded tiles when you switch regions. The Download progress bar identifies whether terrain or buildings are being processed, and the Merge progress bar advances while each CityGML file is scanned.
+- Buildings are clipped exactly to the current merged model rectangle before scaling, so roof and facade geometry cannot extend beyond the final STL edges
+- Building Z uses the stored terrain Z scale plus any **Merge Z scale**, so buildings follow the same vertical exaggeration as the terrain
+- The first merge creates a compressed, clipped cache in `output/cache/buildings/`. It preserves all selected CityGML polygons without mesh simplification, makes later exports much faster, and keeps only the cache matching the current model area.
+
+For the CLI:
+
+```bash
+python download_buildings.py --csv path/to/swissalti_urls.csv
+python download_buildings.py --csv path/to/swissalti_urls.csv --sync
+python build_stl.py --merge-stl output/city.stl --make-solid --buildings --buildings-path reference_data/swissbuildings3d_citygml
+python build_stl.py --merge-stl output/city-test.stl --make-solid --buildings --buildings-path reference_data/swissbuildings3d_citygml --buildings-max-files 1
+```
+
+Use the CityGML 2.0 swissBUILDINGS3D 3.0 Beta files where available. SwissTopo also publishes FileGDB and DWG variants, but this converter currently reads CityGML directly because it preserves roof/facade geometry without requiring proprietary multipatch tooling.
 
 ### Border clipping
 
-Border clipping is optional and uses Swiss boundary shapefiles from `./geometry_data`.
+Border clipping is optional and uses Swiss boundary shapefiles from `./reference_data`.
 
 - **Clip to Swiss border** trims triangles outside the chosen geometry
 - **Border shapefile** lets you choose the `.shp` file
@@ -266,20 +311,29 @@ project/
   download_tiles.py
   build_stl.py
   defaults.py
-  data/
+  input/
     your_urls.csv
-    xyz/
-      tile_001.xyz
-      tile_002.xyz
-    tif/
-      tile_003.tif
+  work/
+    terrain/
+      xyz/
+        tile_001.xyz
+        tile_002.xyz
+      tif/
+        tile_003.tif
+    buildings/
+      auto/
+        swissbuildings3d_.../
+          *.gml
+    water/
+      riverbanks.geojson
   output/
     tiles/
       tile_001.stl
       tile_002.stl
       tile_003.stl
     terrain.stl
-  geometry_data/
+  reference_data/
+    # Manually supplied reference layers only: borders, water and bridges.
     swissboundaries.../
       LANDESGRENZE.shp
       KANTONSGRENZE.shp
@@ -308,11 +362,11 @@ python build_stl.py --all --target-size-mm 150 --input-resolution
 python build_stl.py --all --target-size-mm 150 --crop-rect 2600000 1200000 2600500 1200400
 python build_stl.py --merge-stl output/terrain.stl --weld-tol 0.001 --make-solid
 python build_stl.py --merge-stl output/terrain.stl --water-mode lower --water-lower-mm 1.2
-python build_stl.py --merge-stl output/terrain.stl --water-mode remove --river-width-mm 0.8 --make-solid
+python build_stl.py --merge-stl output/terrain.stl --water-mode remove --make-solid
 python build_stl.py --merge-stl output/terrain.stl --water-mode remove --water-features lakes --make-solid
 python build_stl.py --merge-stl output/terrain.stl --clean-tiles-after-merge
-python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp geometry_data/swissboundaries.../LANDESGRENZE.shp --border-scale auto
-python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp geometry_data/swissboundaries.../KANTONSGRENZE.shp --border-keep "Bern,Uri"
+python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp reference_data/swissboundaries.../LANDESGRENZE.shp --border-scale auto
+python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp reference_data/swissboundaries.../KANTONSGRENZE.shp --border-keep "Bern,Uri"
 ```
 
 ---
@@ -332,7 +386,7 @@ python build_stl.py --merge-stl output/terrain.stl --clip-border --border-shp ge
 **Water handling does nothing**
 - Confirm **Water treatment** is set to **lower** or **remove**.
 - For lower mode, confirm the lower value is greater than `0`.
-- Confirm the standing-water and flowing-water shapefiles exist under `geometry_data`.
+- Confirm the standing-water and flowing-water shapefiles exist under `reference_data`.
 - Confirm the water features actually intersect the merged model bounds.
 
 ---
