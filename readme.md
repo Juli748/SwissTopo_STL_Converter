@@ -279,7 +279,9 @@ The final merge can append swissBUILDINGS3D 3.0 Beta CityGML building surfaces t
 - Or, select **Add swissBUILDINGS3D CityGML** and leave its CityGML path empty. With a SwissALTI CSV selected, the GUI downloads matching CityGML into `work/buildings/auto` and selects it automatically for merge. The **Download matching buildings** option in Step 1 does the same ahead of time. Any merge using the automatic source refreshes it for the current CSV. Repeated runs reuse already extracted files, retain only the latest available edition of each coverage package, and remove stale auto-downloaded tiles when you switch regions. The Download progress bar identifies whether terrain or buildings are being processed, and the Merge progress bar advances while each CityGML file is scanned.
 - Buildings are clipped exactly to the current merged model rectangle before scaling, so roof and facade geometry cannot extend beyond the final STL edges
 - Building Z uses the stored terrain Z scale plus any **Merge Z scale**, so buildings follow the same vertical exaggeration as the terrain
-- The first merge creates a compressed, clipped cache in `output/cache/buildings/`. It preserves all selected CityGML polygons without mesh simplification, makes later exports much faster, and keeps only the cache matching the current model area.
+- **Import workers** splits a large CityGML file at complete polygon boundaries for the first uncached scan. Start with `4`; higher values can exhaust RAM or saturate disk access. Temporary chunk meshes are deleted after the compressed cache is created.
+- Enable **Simplify final model for printing** and enter the printer nozzle diameter to reduce sub-nozzle detail across terrain, water, the printable base, and buildings. It is off by default to preserve full source detail. Use `0.4 mm` for a typical FDM nozzle.
+- The first merge creates a compressed, clipped cache in `output/cache/buildings/`. It makes later exports much faster and keeps only the cache matching the current model area and print-resolution setting.
 
 For the CLI:
 

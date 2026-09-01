@@ -38,7 +38,7 @@ import struct
 import sys
 import unicodedata
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -2435,16 +2435,263 @@ def _building_cache_path(
     xy_scale: float,
     z_scale: float,
     max_files: int,
+    printable: bool,
+    nozzle_mm: float,
 ) -> Path:
     digest = hashlib.sha256()
-    digest.update(b"building-rectangle-clip-v1")
+    digest.update(b"building-rectangle-clip-v2")
     digest.update(repr(tuple(round(value, 4) for value in source_bounds)).encode("ascii"))
-    digest.update(repr((round(xy_scale, 10), round(z_scale, 10), max_files)).encode("ascii"))
+    digest.update(repr((round(xy_scale, 10), round(z_scale, 10), max_files, printable, round(nozzle_mm, 4))).encode("ascii"))
     for path in paths[:max_files] if max_files > 0 else paths:
         stat = path.stat()
         digest.update(str(path.resolve()).encode("utf-8"))
         digest.update(repr((stat.st_size, stat.st_mtime_ns)).encode("ascii"))
     return Path("output") / "cache" / "buildings" / f"{digest.hexdigest()[:20]}.npz"
+
+
+def _simplify_building_polygon_for_print(coords: np.ndarray, nozzle_mm: float) -> np.ndarray:
+    """Remove geometry that is smaller than the printer can reproduce."""
+    grid = float(nozzle_mm) * 0.5
+    snapped = np.round(coords / grid) * grid
+    keep = np.ones(snapped.shape[0], dtype=bool)
+    keep[1:] = np.any(np.abs(snapped[1:] - snapped[:-1]) > 1e-9, axis=1)
+    simplified = snapped[keep]
+    if simplified.shape[0] < 3:
+        return np.empty((0, 3), dtype=np.float64)
+
+    # Remove points that do not change a face at the selected print resolution.
+    previous = np.roll(simplified, 1, axis=0)
+    following = np.roll(simplified, -1, axis=0)
+    segment = following - previous
+    length_squared = np.einsum("ij,ij->i", segment, segment)
+    relative = simplified - previous
+    fraction = np.divide(
+        np.einsum("ij,ij->i", relative, segment),
+        length_squared,
+        out=np.zeros_like(length_squared),
+        where=length_squared > 1e-12,
+    )
+    nearest = previous + np.clip(fraction, 0.0, 1.0)[:, None] * segment
+    distances = np.linalg.norm(simplified - nearest, axis=1)
+    nonessential = (length_squared > 1e-12) & (distances <= grid * 0.35)
+    if np.count_nonzero(~nonessential) >= 3:
+        simplified = simplified[~nonessential]
+    if simplified.shape[0] < 3:
+        return np.empty((0, 3), dtype=np.float64)
+
+    triangles = np.cross(simplified[1:-1] - simplified[0], simplified[2:] - simplified[0])
+    surface_area = float(np.linalg.norm(triangles, axis=1).sum() * 0.5)
+    if surface_area < (float(nozzle_mm) ** 2) * 0.25:
+        return np.empty((0, 3), dtype=np.float64)
+    return simplified
+
+
+def _simplify_mesh_for_print(mesh: Mesh, nozzle_mm: float) -> Mesh:
+    """Snap the final mesh to printable resolution and remove collapsed facets."""
+    grid = float(nozzle_mm) * 0.5
+    if grid <= 0.0 or mesh.faces.size == 0:
+        return mesh
+
+    quantized = np.round(mesh.vertices / grid).astype(np.int64)
+    unique_vertices, remap = np.unique(quantized, axis=0, return_inverse=True)
+    faces = remap[mesh.faces]
+    valid = (
+        (faces[:, 0] != faces[:, 1])
+        & (faces[:, 1] != faces[:, 2])
+        & (faces[:, 0] != faces[:, 2])
+    )
+    faces = faces[valid]
+    vertices = unique_vertices.astype(np.float64) * grid
+    if faces.size:
+        triangle_vectors = np.cross(
+            vertices[faces[:, 1]] - vertices[faces[:, 0]],
+            vertices[faces[:, 2]] - vertices[faces[:, 0]],
+        )
+        triangle_areas = np.linalg.norm(triangle_vectors, axis=1) * 0.5
+        faces = faces[triangle_areas >= (float(nozzle_mm) ** 2) * 0.01]
+    if faces.size:
+        canonical_faces = np.sort(faces, axis=1)
+        _, keep_indices = np.unique(canonical_faces, axis=0, return_index=True)
+        faces = faces[np.sort(keep_indices)]
+    print(
+        f"[PRINT] Simplified final mesh for a {float(nozzle_mm):.2f} mm nozzle: "
+        f"{mesh.vertices.shape[0]:,} vertices / {mesh.faces.shape[0]:,} triangles -> "
+        f"{vertices.shape[0]:,} vertices / {faces.shape[0]:,} triangles"
+    )
+    return Mesh(vertices=vertices, faces=faces.astype(np.int64, copy=False))
+
+
+def _citygml_polygon_chunk_ranges(path: Path, target_bytes: int = 128 * 1024 * 1024) -> List[Tuple[int, int]]:
+    """Split a CityGML file only after complete Polygon elements."""
+    closing_tag = b"</gml:Polygon>"
+    ranges: List[Tuple[int, int]] = []
+    range_start = 0
+    buffer = b""
+    buffer_offset = 0
+    with path.open("rb") as source:
+        while True:
+            chunk = source.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            buffer += chunk
+            search_from = 0
+            while True:
+                end = buffer.find(closing_tag, search_from)
+                if end < 0:
+                    break
+                boundary = buffer_offset + end + len(closing_tag)
+                if boundary - range_start >= target_bytes:
+                    ranges.append((range_start, boundary))
+                    range_start = boundary
+                search_from = end + len(closing_tag)
+            keep_bytes = min(len(closing_tag) - 1, len(buffer))
+            buffer_offset += len(buffer) - keep_bytes
+            buffer = buffer[-keep_bytes:]
+    file_size = path.stat().st_size
+    if range_start < file_size:
+        ranges.append((range_start, file_size))
+    return ranges
+
+
+def _citygml_chunk_mesh_worker(task: tuple) -> tuple[str | None, int, int, int, int]:
+    path_text, start, end, source_bounds, xy_scale, z_scale, printable, nozzle_mm, output_path = task
+    path = Path(path_text)
+    with path.open("rb") as source:
+        source.seek(start)
+        content = source.read(end - start)
+    polygon_re = re.compile(rb"<gml:Polygon\b.*?</gml:Polygon>", re.DOTALL)
+    poslist_re = re.compile(rb"<gml:posList(?P<attrs>[^>]*)>(?P<coords>.*?)</gml:posList>", re.DOTALL)
+    dimension_re = re.compile(rb"srsDimension=[\"'](?P<dimension>\d+)[\"']")
+    vertex_blocks: List[np.ndarray] = []
+    face_blocks: List[np.ndarray] = []
+    vertex_count = 0
+    polygons_seen = polygons_used = polygons_clipped = polygons_print_filtered = 0
+    for polygon in polygon_re.finditer(content):
+        polygons_seen += 1
+        match = poslist_re.search(polygon.group(0))
+        if match is None:
+            continue
+        dimension_match = dimension_re.search(match.group("attrs"))
+        dimension = int(dimension_match.group("dimension")) if dimension_match else 3
+        values = np.fromstring(match.group("coords"), dtype=np.float64, sep=" ")
+        if dimension < 2 or values.size < dimension * 3 or values.size % dimension:
+            continue
+        coords = values.reshape((-1, dimension))
+        if dimension == 2:
+            coords = np.column_stack((coords, np.zeros(coords.shape[0], dtype=np.float64)))
+        else:
+            coords = coords[:, :3]
+        if coords.shape[0] > 1 and np.array_equal(coords[0], coords[-1]):
+            coords = coords[:-1]
+        if coords.shape[0] < 3 or not _bounds_intersect(
+            float(coords[:, 0].min()), float(coords[:, 1].min()),
+            float(coords[:, 0].max()), float(coords[:, 1].max()), *source_bounds,
+        ):
+            continue
+        was_clipped = bool(
+            np.any(coords[:, 0] < source_bounds[0]) or np.any(coords[:, 0] > source_bounds[2])
+            or np.any(coords[:, 1] < source_bounds[1]) or np.any(coords[:, 1] > source_bounds[3])
+        )
+        coords = _clip_polygon_to_xy_bounds(coords, source_bounds)
+        if coords.shape[0] < 3:
+            continue
+        if was_clipped:
+            polygons_clipped += 1
+        scaled = coords * np.asarray((xy_scale, xy_scale, z_scale), dtype=np.float64)
+        if printable:
+            scaled = _simplify_building_polygon_for_print(scaled, nozzle_mm)
+            if scaled.shape[0] < 3:
+                polygons_print_filtered += 1
+                continue
+        indices = np.arange(1, scaled.shape[0] - 1, dtype=np.int64)
+        face_blocks.append(np.column_stack((
+            np.full(indices.shape[0], vertex_count, dtype=np.int64),
+            vertex_count + indices,
+            vertex_count + indices + 1,
+        )))
+        vertex_blocks.append(scaled)
+        vertex_count += scaled.shape[0]
+        polygons_used += 1
+    if not face_blocks:
+        return None, polygons_seen, polygons_used, polygons_clipped, polygons_print_filtered
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out, vertices=np.vstack(vertex_blocks).astype(np.float32), faces=np.vstack(face_blocks).astype(np.int32))
+    return str(out), polygons_seen, polygons_used, polygons_clipped, polygons_print_filtered
+
+
+def _citygml_buildings_to_mesh_parallel(
+    paths: List[Path],
+    *,
+    source_bounds: Tuple[float, float, float, float],
+    xy_scale: float,
+    z_scale: float,
+    max_files: int,
+    printable: bool,
+    nozzle_mm: float,
+    workers: int,
+    temporary_dir: Path,
+) -> Optional[Mesh]:
+    selected_paths = paths[:max_files] if max_files > 0 else paths
+    vertex_blocks: List[np.ndarray] = []
+    face_blocks: List[np.ndarray] = []
+    vertex_count = 0
+    polygons_seen = polygons_used = polygons_clipped = polygons_print_filtered = 0
+    temporary_dir.mkdir(parents=True, exist_ok=True)
+    for file_index, path in enumerate(selected_paths, 1):
+        ranges = _citygml_polygon_chunk_ranges(path)
+        if len(ranges) < 2:
+            return _citygml_buildings_to_mesh(
+                paths,
+                source_bounds=source_bounds,
+                xy_scale=xy_scale,
+                z_scale=z_scale,
+                max_files=max_files,
+                printable=printable,
+                nozzle_mm=nozzle_mm,
+                workers=1,
+                temporary_dir=None,
+            )
+        print(f"[BUILDINGS] Parallel scan: {path.name}, {len(ranges)} polygon-safe chunks, {workers} workers")
+        tasks = [
+            (
+                str(path), start, end, source_bounds, xy_scale, z_scale, printable, nozzle_mm,
+                str(temporary_dir / f"{file_index:03d}_{chunk_index:04d}.npz"),
+            )
+            for chunk_index, (start, end) in enumerate(ranges, 1)
+        ]
+        with ProcessPoolExecutor(max_workers=min(workers, len(tasks))) as executor:
+            futures = [executor.submit(_citygml_chunk_mesh_worker, task) for task in tasks]
+            for completed, future in enumerate(as_completed(futures), 1):
+                result_path, seen, used, clipped, print_filtered = future.result()
+                polygons_seen += seen
+                polygons_used += used
+                polygons_clipped += clipped
+                polygons_print_filtered += print_filtered
+                if result_path:
+                    chunk_path = Path(result_path)
+                    with np.load(chunk_path, allow_pickle=False) as data:
+                        vertices = np.asarray(data["vertices"], dtype=np.float64)
+                        faces = np.asarray(data["faces"], dtype=np.int64)
+                    face_blocks.append(faces + vertex_count)
+                    vertex_blocks.append(vertices)
+                    vertex_count += vertices.shape[0]
+                    chunk_path.unlink(missing_ok=True)
+                print(f"[BUILDINGS_PROGRESS] {completed}/{len(tasks)} {path.name} chunks complete")
+    if not face_blocks:
+        print(f"[BUILDINGS] No CityGML building polygons intersected the model bounds across {len(selected_paths):,} file(s).")
+        return None
+    mesh = Mesh(vertices=np.vstack(vertex_blocks), faces=np.vstack(face_blocks))
+    print(
+        f"[BUILDINGS] Loaded {polygons_used:,} CityGML polygon surface(s) from {len(selected_paths):,} file(s): "
+        f"{mesh.faces.shape[0]:,} triangles; clipped {polygons_clipped:,} polygon(s) to model bounds"
+    )
+    if printable:
+        print(
+            f"[BUILDINGS] Print simplification used a {float(nozzle_mm):.2f} mm nozzle; "
+            f"discarded {polygons_print_filtered:,} sub-nozzle surface(s)."
+        )
+    return mesh
 
 
 def _load_building_mesh_cache(path: Path) -> Optional[Mesh]:
@@ -2486,9 +2733,25 @@ def _citygml_buildings_to_mesh(
     xy_scale: float,
     z_scale: float,
     max_files: int = 0,
+    printable: bool = False,
+    nozzle_mm: float = 0.4,
+    workers: int = 1,
+    temporary_dir: Optional[Path] = None,
 ) -> Optional[Mesh]:
     if not paths:
         return None
+    if workers > 1 and temporary_dir is not None:
+        return _citygml_buildings_to_mesh_parallel(
+            paths,
+            source_bounds=source_bounds,
+            xy_scale=xy_scale,
+            z_scale=z_scale,
+            max_files=max_files,
+            printable=printable,
+            nozzle_mm=nozzle_mm,
+            workers=workers,
+            temporary_dir=temporary_dir,
+        )
 
     vertex_blocks: List[np.ndarray] = []
     face_blocks: List[np.ndarray] = []
@@ -2496,6 +2759,7 @@ def _citygml_buildings_to_mesh(
     files_used = 0
     polygons_used = 0
     polygons_clipped = 0
+    polygons_print_filtered = 0
     selected_paths = paths[:max_files] if max_files > 0 else paths
     total_files = len(selected_paths)
     for path in selected_paths:
@@ -2541,6 +2805,11 @@ def _citygml_buildings_to_mesh(
                 if was_clipped:
                     polygons_clipped += 1
                 scaled = coords * np.asarray((xy_scale, xy_scale, z_scale), dtype=np.float64)
+                if printable:
+                    scaled = _simplify_building_polygon_for_print(scaled, nozzle_mm)
+                    if scaled.shape[0] < 3:
+                        polygons_print_filtered += 1
+                        continue
                 indices = np.arange(1, scaled.shape[0] - 1, dtype=np.int64)
                 face_blocks.append(
                     np.column_stack((
@@ -2565,6 +2834,11 @@ def _citygml_buildings_to_mesh(
         f"from {files_used:,}/{len(paths):,} file(s): {mesh.faces.shape[0]:,} triangles; "
         f"clipped {polygons_clipped:,} polygon(s) to model bounds"
     )
+    if printable:
+        print(
+            f"[BUILDINGS] Print simplification used a {float(nozzle_mm):.2f} mm nozzle; "
+            f"discarded {polygons_print_filtered:,} sub-nozzle surface(s)."
+        )
     return mesh
 
 
@@ -2592,7 +2866,13 @@ def _combined_xy_mask(geoms: List[object], xs: np.ndarray, ys: np.ndarray) -> np
     return mask.reshape(np.shape(xs))
 
 
-def _triangle_intersection_mask(geoms: List[object], tri_vertices: np.ndarray) -> np.ndarray:
+def _triangle_intersection_mask(
+    geoms: List[object],
+    tri_vertices: np.ndarray,
+    *,
+    candidate_mask: Optional[np.ndarray] = None,
+    label: str = "geometry",
+) -> np.ndarray:
     mask = np.zeros(tri_vertices.shape[0], dtype=bool)
     if not geoms or tri_vertices.shape[0] == 0:
         return mask
@@ -2609,11 +2889,17 @@ def _triangle_intersection_mask(geoms: List[object], tri_vertices: np.ndarray) -
     tri_max_x = tri_vertices[:, :, 0].max(axis=1)
     tri_min_y = tri_vertices[:, :, 1].min(axis=1)
     tri_max_y = tri_vertices[:, :, 1].max(axis=1)
+    edge_lengths = np.maximum.reduce((
+        np.linalg.norm(tri_vertices[:, 1, :2] - tri_vertices[:, 0, :2], axis=1),
+        np.linalg.norm(tri_vertices[:, 2, :2] - tri_vertices[:, 1, :2], axis=1),
+        np.linalg.norm(tri_vertices[:, 0, :2] - tri_vertices[:, 2, :2], axis=1),
+    ))
 
-    for geom in geoms:
+    for geom_index, geom in enumerate(geoms, 1):
         bounds = geom.bounds
         candidate_idx = np.flatnonzero(
-            ~mask
+            (candidate_mask if candidate_mask is not None else True)
+            & ~mask
             & (tri_max_x >= bounds[0])
             & (tri_min_x <= bounds[2])
             & (tri_max_y >= bounds[1])
@@ -2621,8 +2907,39 @@ def _triangle_intersection_mask(geoms: List[object], tri_vertices: np.ndarray) -
         )
         if candidate_idx.size == 0:
             continue
+
+        candidates = tri_vertices[candidate_idx, :, :2]
+        vertex_hits = _geometry_xy_mask(geom, candidates[:, :, 0], candidates[:, :, 1])
+        centroid_hits = _geometry_xy_mask(
+            geom,
+            candidates[:, :, 0].mean(axis=1),
+            candidates[:, :, 1].mean(axis=1),
+        )
+        certain_hits = np.any(vertex_hits, axis=1) | centroid_hits
+        if np.any(certain_hits):
+            mask[candidate_idx[certain_hits]] = True
+        uncertain_idx = candidate_idx[~certain_hits]
+        # A triangle with no covered vertex/centroid can only intersect the
+        # polygon when it reaches its boundary. Limit costly exact checks to a
+        # boundary band wide enough to cover the largest terrain triangle.
+        if uncertain_idx.size:
+            boundary_band = geom.boundary.buffer(float(edge_lengths[uncertain_idx].max()) + 1e-9)
+            boundary_hits = _geometry_xy_mask(
+                boundary_band,
+                tri_vertices[uncertain_idx, :, 0].mean(axis=1),
+                tri_vertices[uncertain_idx, :, 1].mean(axis=1),
+            )
+            exact_idx = uncertain_idx[boundary_hits]
+        else:
+            exact_idx = uncertain_idx
+        print(
+            f"[WATER] {label} {geom_index}/{len(geoms)}: {candidate_idx.size:,} candidate faces, "
+            f"{exact_idx.size:,} exact boundary checks"
+        )
+        if exact_idx.size == 0:
+            continue
         prepared = prep(geom)
-        for idx in candidate_idx:
+        for position, idx in enumerate(exact_idx, 1):
             triangle = Polygon(
                 (
                     (float(tri_vertices[idx, 0, 0]), float(tri_vertices[idx, 0, 1])),
@@ -2632,6 +2949,11 @@ def _triangle_intersection_mask(geoms: List[object], tri_vertices: np.ndarray) -
             )
             if triangle.is_valid and not triangle.is_empty and prepared.intersects(triangle):
                 mask[idx] = True
+            if position % 100_000 == 0:
+                print(
+                    f"[WATER] {label} {geom_index}/{len(geoms)}: "
+                    f"{position:,}/{exact_idx.size:,} boundary faces checked"
+                )
     return mask
 
 
@@ -2671,9 +2993,14 @@ def _apply_water_adjustment_to_mesh(
         return Mesh(vertices=out_vertices, faces=mesh.faces)
 
     tri_vertices = vertices[mesh.faces]
-    remove_mask = _triangle_intersection_mask(water_geoms, tri_vertices)
+    remove_mask = _triangle_intersection_mask(water_geoms, tri_vertices, label="Water")
     if bridge_geoms:
-        bridge_mask = _triangle_intersection_mask(bridge_geoms, tri_vertices)
+        bridge_mask = _triangle_intersection_mask(
+            bridge_geoms,
+            tri_vertices,
+            candidate_mask=remove_mask,
+            label="Bridge protection",
+        )
         remove_mask &= ~bridge_mask
     remove_count = int(remove_mask.sum())
     if remove_count == 0:
@@ -2902,6 +3229,9 @@ def merge_stls_mesh(
     buildings_xy_scale: float = 1.0,
     buildings_z_scale: float = 1.0,
     buildings_max_files: int = 0,
+    printable_simplification: bool = False,
+    printer_nozzle_mm: float = 0.4,
+    buildings_workers: int = 1,
     clean_tiles_after_merge: bool = False,
     clip_border: bool = False,
     border_geom=None,
@@ -3057,17 +3387,27 @@ def merge_stls_mesh(
             float(buildings_xy_scale),
             float(buildings_z_scale),
             int(buildings_max_files),
+            bool(printable_simplification),
+            float(printer_nozzle_mm),
         )
         building_mesh = _load_building_mesh_cache(cache_path)
         if building_mesh is None:
             print("[BUILDINGS] Building clipped mesh cache; this is only needed once for this model area.")
-            building_mesh = _citygml_buildings_to_mesh(
-                building_paths,
-                source_bounds=source_bounds,
-                xy_scale=float(buildings_xy_scale),
-                z_scale=float(buildings_z_scale),
-                max_files=int(buildings_max_files),
-            )
+            chunk_dir = cache_path.parent / f"{cache_path.stem}.chunks"
+            try:
+                building_mesh = _citygml_buildings_to_mesh(
+                    building_paths,
+                    source_bounds=source_bounds,
+                    xy_scale=float(buildings_xy_scale),
+                    z_scale=float(buildings_z_scale),
+                    max_files=int(buildings_max_files),
+                    printable=bool(printable_simplification),
+                    nozzle_mm=float(printer_nozzle_mm),
+                    workers=max(1, int(buildings_workers)),
+                    temporary_dir=chunk_dir,
+                )
+            finally:
+                shutil.rmtree(chunk_dir, ignore_errors=True)
             if building_mesh is not None:
                 _save_building_mesh_cache(cache_path, building_mesh)
         if building_mesh is not None:
@@ -3078,6 +3418,9 @@ def merge_stls_mesh(
                 f"[BUILDINGS] Appended buildings. Final mesh: "
                 f"{merged.vertices.shape[0]:,} vertices, {merged.faces.shape[0]:,} triangles"
             )
+
+    if printable_simplification:
+        merged = _simplify_mesh_for_print(merged, float(printer_nozzle_mm))
 
     if binary_out:
         write_binary_stl(merged, out_stl, solid_name=solid_name)
@@ -3231,6 +3574,23 @@ def main() -> None:
         type=int,
         default=0,
         help="Optional limit on CityGML files to read, useful for testing. Default 0 means no limit.",
+    )
+    ap.add_argument(
+        "--buildings-workers",
+        type=int,
+        default=4,
+        help="Worker processes for scanning large CityGML files (default: 4).",
+    )
+    ap.add_argument(
+        "--printable-simplification",
+        action="store_true",
+        help="Simplify the final terrain, water, base, and building mesh for the printer nozzle resolution.",
+    )
+    ap.add_argument(
+        "--printer-nozzle-mm",
+        type=float,
+        default=0.4,
+        help="Printer nozzle diameter used by --printable-simplification (default: 0.4 mm).",
     )
     ap.add_argument(
         "--merge-z-scale",
@@ -3395,6 +3755,10 @@ def main() -> None:
         ap.error("--buildings can only be used with --merge-stl.")
     if args.buildings_max_files < 0:
         ap.error("--buildings-max-files must be >= 0.")
+    if args.buildings_workers < 1:
+        ap.error("--buildings-workers must be >= 1.")
+    if args.printable_simplification and float(args.printer_nozzle_mm) <= 0.0:
+        ap.error("--printer-nozzle-mm must be > 0 when --printable-simplification is used.")
 
     try:
         crop_rect = _parse_crop_rect(args.crop_rect)
@@ -3498,6 +3862,9 @@ def main() -> None:
             buildings_xy_scale=float(buildings_xy_scale),
             buildings_z_scale=float(buildings_z_scale),
             buildings_max_files=int(args.buildings_max_files),
+            printable_simplification=bool(args.printable_simplification),
+            printer_nozzle_mm=float(args.printer_nozzle_mm),
+            buildings_workers=int(args.buildings_workers),
             clean_tiles_after_merge=bool(args.clean_tiles_after_merge),
             clip_border=bool(args.clip_border),
             border_geom=border_geom,

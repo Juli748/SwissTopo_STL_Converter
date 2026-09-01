@@ -749,6 +749,9 @@ class App(tk.Tk):
         self.buildings_enabled_var = tk.BooleanVar(value=DEFAULTS["buildings_enabled"])
         self.buildings_path_var = tk.StringVar(value=DEFAULTS["buildings_path"])
         self.buildings_max_files_var = tk.StringVar(value=DEFAULTS["buildings_max_files"])
+        self.buildings_workers_var = tk.StringVar(value=DEFAULTS["buildings_workers"])
+        self.printable_simplification_var = tk.BooleanVar(value=DEFAULTS["printable_simplification"])
+        self.printer_nozzle_mm_var = tk.StringVar(value=DEFAULTS["printer_nozzle_mm"])
         self.clean_tiles_after_merge_var = tk.BooleanVar(value=DEFAULTS["clean_tiles_after_merge"])
         self.make_solid_var = tk.BooleanVar(value=DEFAULTS["make_solid"])
         self.base_mode_var = tk.StringVar(value=DEFAULTS["base_mode"])
@@ -969,6 +972,10 @@ class App(tk.Tk):
         self.buildings_max_label.grid(row=1, column=3, sticky=tk.W, padx=(12, 0))
         self.buildings_max_entry = ttk.Entry(buildings_frame, textvariable=self.buildings_max_files_var, width=8)
         self.buildings_max_entry.grid(row=1, column=4, sticky=tk.W, padx=(8, 0))
+        self.buildings_workers_label = ttk.Label(buildings_frame, text="Import workers:")
+        self.buildings_workers_label.grid(row=2, column=0, sticky=tk.W, pady=2)
+        self.buildings_workers_entry = ttk.Entry(buildings_frame, textvariable=self.buildings_workers_var, width=8)
+        self.buildings_workers_entry.grid(row=2, column=1, sticky=tk.W, padx=(8, 0))
         buildings_frame.columnconfigure(1, weight=1)
 
         merge_summary = ttk.Label(frame, textvariable=self.merge_summary_var)
@@ -995,8 +1002,22 @@ class App(tk.Tk):
         merge_z_entry = ttk.Entry(self.merge_advanced_frame, textvariable=self.merge_z_scale_var, width=10)
         merge_z_entry.grid(row=0, column=3, sticky=tk.W)
 
+        final_optimization_frame = ttk.LabelFrame(frame, text="Final Print Optimization")
+        final_optimization_frame.grid(row=8, column=0, sticky=tk.EW, pady=(6, 0))
+        self.printable_simplification_check = ttk.Checkbutton(
+            final_optimization_frame,
+            text="Simplify final model for printing",
+            variable=self.printable_simplification_var,
+            command=self._update_merge_controls,
+        )
+        self.printable_simplification_check.grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.printer_nozzle_label = ttk.Label(final_optimization_frame, text="Nozzle (mm):")
+        self.printer_nozzle_label.grid(row=0, column=1, sticky=tk.W, padx=(16, 0))
+        self.printer_nozzle_entry = ttk.Entry(final_optimization_frame, textvariable=self.printer_nozzle_mm_var, width=10)
+        self.printer_nozzle_entry.grid(row=0, column=2, sticky=tk.W, padx=(8, 0))
+
         action_row = ttk.Frame(frame)
-        action_row.grid(row=8, column=0, sticky=tk.EW, pady=(6, 0))
+        action_row.grid(row=9, column=0, sticky=tk.EW, pady=(6, 0))
         self.status_vars["merge"] = tk.StringVar(value=DEFAULTS["status_idle"])
         self.status_labels["merge"] = ttk.Label(action_row, textvariable=self.status_vars["merge"])
         self.status_labels["merge"].grid(row=0, column=0, sticky=tk.W)
@@ -1088,6 +1109,18 @@ class App(tk.Tk):
             Tooltip(
                 self.buildings_max_entry,
                 "Optional test limit for how many CityGML files to read. Leave empty for all.",
+            ),
+            Tooltip(
+                self.buildings_workers_entry,
+                "Worker processes for the first CityGML scan. Use 2-4; more can exhaust RAM or saturate disk access.",
+            ),
+            Tooltip(
+                self.printable_simplification_check,
+                "Reduce terrain, water, base, and building detail smaller than the selected printer nozzle.",
+            ),
+            Tooltip(
+                self.printer_nozzle_entry,
+                "Physical nozzle diameter in millimetres. A 0.4 mm nozzle is the common default.",
             ),
             Tooltip(
                 border_mode_label,
@@ -2072,6 +2105,14 @@ class App(tk.Tk):
             max_files = self.buildings_max_files_var.get().strip()
             if max_files:
                 args += ["--buildings-max-files", max_files]
+            building_workers = self.buildings_workers_var.get().strip()
+            if building_workers:
+                args += ["--buildings-workers", building_workers]
+        if self.printable_simplification_var.get():
+            args.append("--printable-simplification")
+            nozzle_mm = self.printer_nozzle_mm_var.get().strip()
+            if nozzle_mm:
+                args += ["--printer-nozzle-mm", nozzle_mm]
 
         if self.make_solid_var.get():
             args.append("--make-solid")
@@ -2407,8 +2448,13 @@ class App(tk.Tk):
         self.buildings_path_entry.configure(state="normal" if buildings_enabled else "disabled")
         self.buildings_path_btn.configure(state="normal" if buildings_enabled else "disabled")
         self.buildings_max_entry.configure(state="normal" if buildings_enabled else "disabled")
+        self.buildings_workers_entry.configure(state="normal" if buildings_enabled else "disabled")
+        printable_enabled = self.printable_simplification_var.get()
+        self.printer_nozzle_entry.configure(state="normal" if printable_enabled else "disabled")
         self.buildings_path_label.configure(foreground="#e2e8f0" if buildings_enabled else "#6b7280")
         self.buildings_max_label.configure(foreground="#e2e8f0" if buildings_enabled else "#6b7280")
+        self.buildings_workers_label.configure(foreground="#e2e8f0" if buildings_enabled else "#6b7280")
+        self.printer_nozzle_label.configure(foreground="#e2e8f0" if printable_enabled else "#6b7280")
 
         if self.show_merge_advanced_var.get():
             self.merge_advanced_frame.grid()
