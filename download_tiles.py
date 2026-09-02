@@ -217,12 +217,14 @@ def main():
                 future_map[executor.submit(download_file, url, tif_dir / filename)] = (url, filename)
             elif kind == "xyz":
                 future_map[executor.submit(download_file, url, xyz_dir / filename)] = (url, filename)
+        failures = 0
         for future in as_completed(future_map):
             url, filename = future_map[future]
             completed += 1
             try:
                 future.result()
             except Exception as exc:
+                failures += 1
                 print(f"Failed: {url} ({exc})")
             print(f"[PROGRESS] {completed}/{total} {filename}")
     # Best-effort cleanup of temp zip folder.
@@ -245,6 +247,10 @@ def main():
         print(f"Copied {copied} XYZ files to {xyz_dir}")
 
     shutil.rmtree(extract_dir, ignore_errors=True)
+
+    if failures:
+        print(f"[ERROR] {failures} download(s) failed. Aborting so missing tiles are not silently merged.")
+        return 1
 
     print("Done.")
     return 0

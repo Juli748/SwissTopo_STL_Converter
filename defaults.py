@@ -42,7 +42,7 @@ DEFAULTS = {
     "buildings_workers": "4",
     "printable_simplification": False,
     "printer_nozzle_mm": "0.4",
-    "clean_tiles_after_merge": True,
+    "clean_tiles_after_merge": False,
     "make_solid": True,
     "base_thickness": "5.0",
     "base_z": "",

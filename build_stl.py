@@ -1165,6 +1165,66 @@ def _list_stl_files() -> List[Path]:
     return stl_files
 
 
+def _tile_id_from_path(path: Path) -> Optional[Tuple[int, int]]:
+    matches = re.findall(r"(?<!\d)(\d{4})-(\d{4})(?!\d)", path.stem)
+    if not matches:
+        return None
+    x_raw, y_raw = matches[-1]
+    return int(x_raw), int(y_raw)
+
+
+def _validate_no_enclosed_tile_holes(stl_files: List[Path]) -> None:
+    tile_ids = {_tile_id_from_path(path) for path in stl_files}
+    tile_ids.discard(None)
+    present = {tile_id for tile_id in tile_ids if tile_id is not None}
+    if len(present) < 2:
+        return
+
+    xs = [x for x, _ in present]
+    ys = [y for _, y in present]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+    search_min_x, search_max_x = min_x - 1, max_x + 1
+    search_min_y, search_max_y = min_y - 1, max_y + 1
+
+    outside: set[Tuple[int, int]] = set()
+    queue: List[Tuple[int, int]] = []
+    for x in range(search_min_x, search_max_x + 1):
+        queue.append((x, search_min_y))
+        queue.append((x, search_max_y))
+    for y in range(search_min_y + 1, search_max_y):
+        queue.append((search_min_x, y))
+        queue.append((search_max_x, y))
+
+    while queue:
+        x, y = queue.pop()
+        cell = (x, y)
+        if cell in outside or cell in present:
+            continue
+        if x < search_min_x or x > search_max_x or y < search_min_y or y > search_max_y:
+            continue
+        outside.add(cell)
+        queue.extend(((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)))
+
+    holes = []
+    for x in range(min_x, max_x + 1):
+        for y in range(min_y, max_y + 1):
+            cell = (x, y)
+            if cell not in present and cell not in outside:
+                holes.append(cell)
+
+    if not holes:
+        return
+
+    preview = ", ".join(f"{x}-{y}" for x, y in holes[:20])
+    if len(holes) > 20:
+        preview += f", ... ({len(holes)} total)"
+    raise SystemExit(
+        "Refusing to merge because the STL tile set has enclosed square hole(s): "
+        f"{preview}. Re-download or re-convert the missing tile(s), then run the merge again."
+    )
+
+
 def _clear_tiles_dir() -> None:
     tiles_dir = Path("./output/tiles")
     if not tiles_dir.exists():
@@ -2958,10 +3018,137 @@ def _triangle_intersection_mask(
 
 
 def _compact_mesh(mesh: Mesh) -> Mesh:
+    if mesh.faces.size == 0:
+        return Mesh(vertices=np.empty((0, 3), dtype=np.float64), faces=np.empty((0, 3), dtype=np.int64))
     used = np.unique(mesh.faces.ravel())
     remap = np.full(mesh.vertices.shape[0], -1, dtype=np.int64)
     remap[used] = np.arange(used.shape[0], dtype=np.int64)
     return Mesh(vertices=mesh.vertices[used], faces=remap[mesh.faces])
+
+
+def _remove_duplicate_faces(mesh: Mesh) -> Mesh:
+    """Remove repeated coincident faces after vertex welding."""
+    if mesh.faces.size == 0:
+        return mesh
+
+    faces = mesh.faces.astype(np.int64, copy=False)
+    valid = (
+        (faces[:, 0] != faces[:, 1])
+        & (faces[:, 1] != faces[:, 2])
+        & (faces[:, 0] != faces[:, 2])
+    )
+    collapsed_count = int((~valid).sum())
+    faces = faces[valid]
+    if faces.size == 0:
+        if collapsed_count:
+            print(f"[CLEAN] Removed {collapsed_count:,} collapsed face(s)")
+        return Mesh(vertices=mesh.vertices, faces=faces.reshape(0, 3))
+
+    canonical = np.sort(faces, axis=1)
+    _, first_indices, inverse, counts = np.unique(
+        canonical,
+        axis=0,
+        return_index=True,
+        return_inverse=True,
+        return_counts=True,
+    )
+    keep = np.zeros(faces.shape[0], dtype=bool)
+    keep[first_indices[counts == 1]] = True
+
+    duplicate_groups = np.flatnonzero(counts > 1)
+    normals = compute_normals(mesh.vertices, faces)
+    removed_opposing = 0
+    kept_duplicates = 0
+    for group_id in duplicate_groups:
+        idx = np.flatnonzero(inverse == group_id)
+        group_normals = normals[idx]
+        opposing = False
+        if idx.size > 1:
+            dots = group_normals @ group_normals.T
+            opposing = bool(np.any(dots < -0.95))
+        if opposing:
+            removed_opposing += int(idx.size)
+            continue
+        keep[int(idx[0])] = True
+        kept_duplicates += int(idx.size - 1)
+
+    removed_total = collapsed_count + int((~keep).sum())
+    if removed_total:
+        print(
+            f"[CLEAN] Removed {removed_total:,} duplicate/collapsed face(s) "
+            f"({removed_opposing:,} opposing coincident face(s), {kept_duplicates:,} repeated face(s))"
+        )
+    return Mesh(vertices=mesh.vertices, faces=faces[keep].astype(np.int64, copy=False))
+
+
+def _remove_vertical_wall_faces(mesh: Mesh, *, normal_z_tol: float = 1e-6, z_span_tol: float = 1e-9) -> Mesh:
+    """
+    Strip artificial tile wall faces before global solidification.
+
+    SwissTopo terrain tiles are height fields, so vertical faces in the merged
+    terrain mesh come from prior per-tile bases or unwelded tile boundaries.
+    The global base/walls are rebuilt later from the cleaned outer boundary.
+    """
+    if mesh.faces.size == 0:
+        return mesh
+
+    tri_vertices = mesh.vertices[mesh.faces]
+    normals = compute_normals(mesh.vertices, mesh.faces)
+    z_span = tri_vertices[:, :, 2].max(axis=1) - tri_vertices[:, :, 2].min(axis=1)
+    vertical = (np.abs(normals[:, 2]) <= float(normal_z_tol)) & (z_span > float(z_span_tol))
+    removed = int(vertical.sum())
+    if removed == 0:
+        return mesh
+    print(f"[CLEAN] Removed {removed:,} vertical tile wall face(s)")
+    return Mesh(vertices=mesh.vertices, faces=mesh.faces[~vertical].astype(np.int64, copy=False))
+
+
+def _remove_tile_base_faces(mesh: Mesh, *, normal_z_tol: float = 1e-6, z_span_tol: float = 1e-9) -> Mesh:
+    """Remove flat bottom caps that came from previously solidified tile STLs."""
+    if mesh.faces.size == 0:
+        return mesh
+
+    tri_vertices = mesh.vertices[mesh.faces]
+    normals = compute_normals(mesh.vertices, mesh.faces)
+    z_span = tri_vertices[:, :, 2].max(axis=1) - tri_vertices[:, :, 2].min(axis=1)
+    vertical = (np.abs(normals[:, 2]) <= float(normal_z_tol)) & (z_span > float(z_span_tol))
+    if not np.any(vertical):
+        return mesh
+
+    bottom_vertex_mask = np.zeros(mesh.vertices.shape[0], dtype=bool)
+    vertical_faces = mesh.faces[vertical]
+    vertical_vertices = tri_vertices[vertical]
+    vertical_min_z = vertical_vertices[:, :, 2].min(axis=1)
+    is_bottom = np.abs(vertical_vertices[:, :, 2] - vertical_min_z[:, None]) <= float(z_span_tol)
+    bottom_vertex_mask[vertical_faces[is_bottom]] = True
+
+    flat = z_span <= float(z_span_tol)
+    bottom_cap = flat & np.all(bottom_vertex_mask[mesh.faces], axis=1)
+    removed = int(bottom_cap.sum())
+    if removed == 0:
+        return mesh
+    print(f"[CLEAN] Removed {removed:,} old tile bottom-cap face(s)")
+    return Mesh(vertices=mesh.vertices, faces=mesh.faces[~bottom_cap].astype(np.int64, copy=False))
+
+
+def _clean_merged_terrain_mesh(mesh: Mesh) -> Mesh:
+    """Clean tile-boundary artifacts before water handling and global base creation."""
+    before_vertices = int(mesh.vertices.shape[0])
+    before_faces = int(mesh.faces.shape[0])
+    mesh = _remove_duplicate_faces(mesh)
+    mesh = _remove_tile_base_faces(mesh)
+    mesh = _remove_vertical_wall_faces(mesh)
+    mesh = _remove_duplicate_faces(mesh)
+    mesh = _compact_mesh(mesh)
+    after_vertices = int(mesh.vertices.shape[0])
+    after_faces = int(mesh.faces.shape[0])
+    if before_vertices != after_vertices or before_faces != after_faces:
+        print(
+            f"[CLEAN] Merged terrain mesh: "
+            f"{before_vertices:,} vertices / {before_faces:,} triangles -> "
+            f"{after_vertices:,} vertices / {after_faces:,} triangles"
+        )
+    return mesh
 
 
 def _apply_water_adjustment_to_mesh(
@@ -3243,6 +3430,7 @@ def merge_stls_mesh(
     stl_files = _list_stl_files()
     print(f"Found {len(stl_files)} STL file(s) under ./output/tiles")
     print(f"[MERGE-MESH] Output: {out_stl}")
+    _validate_no_enclosed_tile_holes(stl_files)
 
     use_weld = float(weld_tol) > 0.0
     if use_weld:
@@ -3334,6 +3522,8 @@ def merge_stls_mesh(
 
     if z_scale != 1.0:
         merged = scale_mesh_z(merged, float(z_scale))
+
+    merged = _clean_merged_terrain_mesh(merged)
 
     if water_mode != "off":
         model_bounds = (
@@ -4005,12 +4195,16 @@ def main() -> None:
 
         workers = max(1, int(args.workers))
         if workers == 1 or len(tasks) == 1:
+            failures = 0
             for task in tasks:
                 input_path = task[0]
                 try:
                     _convert_worker(task)
                 except Exception as e:
+                    failures += 1
                     print(f"ERROR converting {input_path}: {e}")
+            if failures:
+                raise SystemExit(f"{failures} tile(s) failed during conversion; aborting before merge.")
             return
 
         total = len(tasks)
@@ -4030,7 +4224,7 @@ def main() -> None:
                 print(f"[PROGRESS] {completed}/{total} {input_path.name}")
 
         if failures:
-            print(f"[WARN] {failures} tile(s) failed during conversion.")
+            raise SystemExit(f"{failures} tile(s) failed during conversion; aborting before merge.")
         return
 
     ap.error("Use --all to convert tiles or --merge-stl <out.stl> to merge.")
